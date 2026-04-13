@@ -31,11 +31,18 @@
 
 ## Why this exists
 
-USEReady needs to migrate **5,000+ Tableau workbooks** to Power BI. Doing
-that by hand is infeasible, and naïve regex-based converters fail on the
-long tail of real-world Tableau constructs (LODs, table calcs,
-cross-datasource blends, object-graph schemas, dashboard parameter
-navigation, composite-key relationships, …).
+USEReady is building an **agentic, AI-driven tool** for migrating Tableau
+workbooks to Power BI. Naïve regex-based converters break on the long tail
+of real-world Tableau constructs — LODs, table calcs, cross-datasource
+blends, object-graph schemas, dashboard parameter navigation, composite-key
+relationships, and the rest. A rules-only approach can't keep up with the
+variety of inputs customers throw at us.
+
+The agent-first design is what lets the tool migrate any number of
+workbooks — one, a handful, or an entire enterprise tenant — without
+per-workbook hand-holding. Claude plans, converts, validates, and
+self-corrects; deterministic code handles the I/O and the strict
+contracts where determinism matters.
 
 This tool solves the problem by combining:
 
@@ -48,8 +55,9 @@ This tool solves the problem by combining:
   format, with an Analysis Services engine validation loop that
   self-heals remaining DAX errors.
 
-The target is **generic** — no per-workbook hacks — so that a single
-pipeline can drive thousands of migrations unattended.
+The target is **generic** — no per-workbook hacks — so that the same
+agentic pipeline can drive a single migration or an entire tenant's
+worth of workbooks, unattended.
 
 ---
 
@@ -418,8 +426,9 @@ tableau-parser/tableau-parser/
 - **Visual fidelity** — chart-type coverage in `visual_migrator` is
   broad but not exhaustive; unusual Tableau marks (polygon maps,
   custom shape encodings) fall back to best-effort table visuals.
-- **Scale tests** — tested on ~6 varied workbooks; end-to-end runs
-  against the 5,000-workbook corpus are scheduled.
+- **Scale tests** — tested on ~6 varied workbooks spanning most
+  Tableau construct categories; broader tenant-scale runs are
+  scheduled.
 
 ---
 
