@@ -1,30 +1,62 @@
-"""Migration report generator.
+"""Migration report generator (Excel workbook).
 
-Produces a human-readable Markdown report summarising what a migration
-run did: which Tableau datasources became which Power BI tables, which
-worksheets became which PBI visuals, which dashboards became which
-report pages, how each Tableau calculation was converted to DAX, and
-any warnings worth surfacing.
+Produces ``output/<workbook>/migration_report.xlsx`` at the end of every
+pipeline run. An Excel workbook is the right format for this report
+because reviewers want to sort, filter, and scan the Tableau ->
+Power BI mapping — none of which Markdown does well.
 
-The goal is an answer to the questions a business user / reviewer
-always asks after a migration:
+Sheets:
 
-- "My bar chart on sheet X — what did it become in Power BI?"
-- "Are all my dashboards accounted for?"
-- "Where did my blended datasource go?"
+- **Summary**           — Tableau vs PBI counts for every item type
+                          (datasources, calcs, worksheets, dashboards, …).
+- **Data Model**        — each Tableau datasource mapped to a PBI table,
+                          with the table's kind (CSV import / empty
+                          logical wrapper / calculated / PostgreSQL) and
+                          source file + byte size.
+- **Relationships**     — every relationship in the model, with
+                          cardinality, direction, and active flag.
+- **Visual Mapping**    — the main deliverable: one row per field-role
+                          assignment, so you can filter by PBI visual
+                          type to see "all my cards", "all my maps",
+                          etc. Includes Tableau mark type, shelf
+                          structure, and the PBI visualType + role +
+                          table + column + aggregation.
+- **Dashboards → Pages**— dashboard-to-page mapping with visual /
+                          slicer / text / image counts.
+- **Calculations → DAX**— every Tableau formula side-by-side with the
+                          generated DAX and its kind (measure / calc
+                          column).
+- **Parameters**        — Tableau parameters with type, current value,
+                          and allowable values.
 
-Written to ``output/<workbook>/migration_report.md`` at the end of
-every pipeline run.
+All header rows are styled and frozen; columns are auto-sized to the
+longest value (clamped) so the workbook is readable on open.
 """
 
 import json
 import os
 from datetime import datetime
 
+from openpyxl import Workbook
+from openpyxl.styles import Alignment, Font, PatternFill, Border, Side
+from openpyxl.utils import get_column_letter
+
 
 # ---------------------------------------------------------------------
-# Small helpers
+# Style constants
 # ---------------------------------------------------------------------
+
+_HEADER_FILL = PatternFill("solid", fgColor="1F4E78")     # dark blue
+_HEADER_FONT = Font(bold=True, color="FFFFFF", size=11)
+_TITLE_FONT = Font(bold=True, color="1F4E78", size=14)
+_SUBTLE_FONT = Font(italic=True, color="595959", size=10)
+_ZEBRA_FILL = PatternFill("solid", fgColor="F2F2F2")      # light grey
+_WARN_FILL = PatternFill("solid", fgColor="FFF3CD")       # soft yellow
+_EMPTY_FILL = PatternFill("solid", fgColor="F8D7DA")      # soft red
+_WRAP = Alignment(wrap_text=True, vertical="top")
+_TOP = Alignment(vertical="top")
+_THIN = Side(border_style="thin", color="BFBFBF")
+_CELL_BORDER = Border(left=_THIN, right=_THIN, top=_THIN, bottom=_THIN)
 
 # Reverse map of PBI aggregation-function codes used in prototypeQuery.
 _AGG_NAME_BY_CODE = {
@@ -32,47 +64,99 @@ _AGG_NAME_BY_CODE = {
 }
 
 
-def _esc(text):
-    """Escape a cell for inclusion in a GitHub-flavored Markdown table."""
-    if text is None:
+# ---------------------------------------------------------------------
+# Sheet writing helpers
+# ---------------------------------------------------------------------
+
+def _write_title(ws, title, subtitle=None):
+    """Write a sheet title + optional subtitle in rows 1–2, return next free row."""
+    ws.cell(row=1, column=1, value=title).font = _TITLE_FONT
+    if subtitle:
+        ws.cell(row=2, column=1, value=subtitle).font = _SUBTLE_FONT
+        return 4
+    return 3
+
+
+def _write_table(ws, start_row, headers, rows, row_fills=None):
+    """Write a header row + data rows starting at ``start_row``.
+
+    ``row_fills`` is an optional parallel list of PatternFills (or None)
+    for per-row shading (used to flag empty-wrapper / warning rows).
+    Applies zebra striping over that. Header row is frozen.
+    """
+    # Header
+    for ci, h in enumerate(headers, start=1):
+        c = ws.cell(row=start_row, column=ci, value=h)
+        c.font = _HEADER_FONT
+        c.fill = _HEADER_FILL
+        c.alignment = Alignment(vertical="center", horizontal="left")
+        c.border = _CELL_BORDER
+
+    # Data rows
+    for ri, row in enumerate(rows):
+        base_fill = row_fills[ri] if row_fills and ri < len(row_fills) else None
+        stripe = _ZEBRA_FILL if (ri % 2 == 1 and base_fill is None) else None
+        fill = base_fill or stripe
+        for ci, val in enumerate(row, start=1):
+            cell = ws.cell(row=start_row + 1 + ri, column=ci, value=val)
+            cell.alignment = _WRAP
+            cell.border = _CELL_BORDER
+            if fill:
+                cell.fill = fill
+
+    # Freeze below the header row
+    ws.freeze_panes = ws.cell(row=start_row + 1, column=1).coordinate
+
+    # Enable autofilter on the data range
+    last_col = get_column_letter(len(headers))
+    last_row = start_row + len(rows)
+    ws.auto_filter.ref = f"A{start_row}:{last_col}{last_row}"
+
+
+def _autosize_columns(ws, start_row, min_width=8, max_width=80):
+    """Approximate auto-sizing based on the content in each column."""
+    max_col = ws.max_column
+    for col in range(1, max_col + 1):
+        letter = get_column_letter(col)
+        longest = min_width
+        for row in range(start_row, ws.max_row + 1):
+            val = ws.cell(row=row, column=col).value
+            if val is None:
+                continue
+            # Treat multi-line values conservatively: take the longest line.
+            lines = str(val).splitlines() or [""]
+            length = max(len(line) for line in lines)
+            longest = max(longest, length + 2)
+        ws.column_dimensions[letter].width = min(longest, max_width)
+
+
+def _normalise(val):
+    """Coerce values into something openpyxl can write safely."""
+    if val is None:
         return ""
-    s = str(text)
-    # Pipes break tables; newlines too. Keep things on one row.
-    return s.replace("|", "\\|").replace("\n", " ").replace("\r", " ").strip()
-
-
-def _truncate(text, limit=120):
-    s = _esc(text)
-    if len(s) > limit:
-        return s[: limit - 1].rstrip() + "…"
-    return s
-
-
-def _header(level, text):
-    return f"{'#' * level} {text}\n\n"
-
-
-def _table(rows):
-    """Render a list of rows (first row = header) as a Markdown table."""
-    if not rows:
-        return "_(none)_\n\n"
-    header = rows[0]
-    out = ["| " + " | ".join(_esc(c) for c in header) + " |",
-           "| " + " | ".join("---" for _ in header) + " |"]
-    for r in rows[1:]:
-        out.append("| " + " | ".join(_esc(c) for c in r) + " |")
-    return "\n".join(out) + "\n\n"
+    if isinstance(val, (str, int, float, bool)):
+        return val
+    try:
+        return json.dumps(val, ensure_ascii=False)
+    except Exception:
+        return str(val)
 
 
 # ---------------------------------------------------------------------
-# Section builders — each returns a string of Markdown.
+# Section builders — each writes to its own sheet.
 # ---------------------------------------------------------------------
 
-def _section_summary(workbook_name, input_path, metadata, bim, visual_map, pages,
-                     db_contexts, stats):
+def _sheet_summary(wb, workbook_name, input_path, metadata, bim, visual_map,
+                   pages, db_contexts, stats, now):
+    ws = wb.create_sheet("Summary")
+    row = _write_title(
+        ws,
+        f"Migration report — {workbook_name}",
+        f"Source: {input_path or '(unknown)'}    Generated: {now}    Target: Power BI (PBIP / model.bim)",
+    )
+
     model = bim.get("model", {}) if bim else {}
     tables = [t for t in model.get("tables", []) if not t.get("isPrivate")]
-
     total_measures = sum(len(t.get("measures", []) or []) for t in tables)
     total_calc_cols = sum(
         sum(1 for c in (t.get("columns", []) or []) if c.get("type") == "calculated")
@@ -81,244 +165,294 @@ def _section_summary(workbook_name, input_path, metadata, bim, visual_map, pages
     total_cols = sum(len(t.get("columns", []) or []) for t in tables) - total_calc_cols
     rels = model.get("relationships", []) or []
 
+    headers = ["Item", "Tableau (source)", "Power BI (target)"]
     rows = [
-        ["Item", "Tableau (source)", "Power BI (target)"],
         ["Workbook", os.path.basename(input_path or ""), workbook_name or ""],
         ["Datasources / Tables",
-         str(len(metadata.get("datasources", []) or [])),
-         str(len(tables))],
-        ["Physical columns", "-", str(total_cols)],
+         len(metadata.get("datasources", []) or []), len(tables)],
+        ["Physical columns", "—", total_cols],
         ["Calculations",
-         str(len(metadata.get("calculations", []) or [])),
+         len(metadata.get("calculations", []) or []),
          f"{total_measures} measures + {total_calc_cols} calc columns"],
         ["Parameters",
-         str(len(metadata.get("parameters", []) or [])),
+         len(metadata.get("parameters", []) or []),
          "Parameters table (measures)"],
         ["Worksheets / Visuals",
-         str(len(metadata.get("worksheets", []) or [])),
-         str(len(visual_map or {}))],
+         len(metadata.get("worksheets", []) or []), len(visual_map or {})],
         ["Dashboards / Pages",
-         str(len(db_contexts or [])),
-         str(len(pages or []))],
-        ["Relationships", "-", str(len(rels))],
+         len(db_contexts or []), len(pages or [])],
+        ["Relationships", "—", len(rels)],
     ]
+    _write_table(ws, row, headers, [[_normalise(c) for c in r] for r in rows])
 
-    out = _header(2, "Summary") + _table(rows)
-
+    # Pipeline stats block below
     if stats:
-        stat_rows = [["Metric", "Value"]]
-        for k, v in stats.items():
-            stat_rows.append([k, v])
-        out += _header(3, "Pipeline stats") + _table(stat_rows)
+        row2 = ws.max_row + 3
+        ws.cell(row=row2, column=1, value="Pipeline stats").font = _TITLE_FONT
+        _write_table(
+            ws, row2 + 1, ["Metric", "Value"],
+            [[_normalise(k), _normalise(v)] for k, v in stats.items()],
+        )
 
-    return out
+    _autosize_columns(ws, start_row=3)
 
 
-def _section_data_model(metadata, bim, csv_dir):
-    """Tableau datasources -> PBI tables, with CSV-on-disk lookup for row counts."""
+def _sheet_data_model(wb, metadata, bim, csv_dir):
+    ws = wb.create_sheet("Data Model")
+    row = _write_title(
+        ws, "Data model — Tableau datasources → Power BI tables",
+        "Kind: CSV import / Empty wrapper (Tableau blend) / PostgreSQL / Calculated",
+    )
+
     model = bim.get("model", {}) if bim else {}
     tables = [t for t in model.get("tables", []) if not t.get("isPrivate")]
+    ds_by_caption = {ds.get("caption", ""): ds for ds in (metadata.get("datasources", []) or [])}
 
-    # datasource captions from metadata
-    ds_by_caption = {}
-    for ds in metadata.get("datasources", []) or []:
-        cap = ds.get("caption", "")
-        if cap:
-            ds_by_caption[cap] = ds
+    headers = ["Tableau Datasource", "PBI Table", "Columns", "Kind", "Source file", "Size (bytes)", "Notes"]
+    data_rows = []
+    row_fills = []
 
-    rows = [["Tableau Datasource", "PBI Table", "Columns", "Kind", "Source / Notes"]]
     for t in tables:
         name = t.get("name", "")
         cols = t.get("columns", []) or []
         n_cols = len(cols)
-        # Determine kind from first partition
         parts = t.get("partitions", []) or []
         part_expr = ""
         if parts:
             exp = parts[0].get("source", {}).get("expression", "")
-            if isinstance(exp, list):
-                part_expr = "\n".join(exp)
-            else:
-                part_expr = str(exp)
+            part_expr = "\n".join(exp) if isinstance(exp, list) else str(exp)
+
+        size_bytes = ""
+        source_file = ""
+        notes = ""
+        fill = None
+
         if "#table(" in part_expr and "{}" in part_expr:
             kind = "Empty (logical wrapper)"
-            source = "No physical extract — Tableau blend / Multiple Connections"
+            notes = "No physical extract — Tableau blend / Multiple Connections. Calculated columns and measures still evaluate against related tables."
+            fill = _WARN_FILL
         elif "Csv.Document" in part_expr:
             kind = "CSV import"
-            csv_file = f"{name}.csv"
-            csv_path = os.path.join(csv_dir, csv_file) if csv_dir else ""
+            source_file = f"{name}.csv"
+            csv_path = os.path.join(csv_dir, source_file) if csv_dir else ""
             if csv_path and os.path.exists(csv_path):
-                size = os.path.getsize(csv_path)
-                source = f"{csv_file} ({size:,} bytes)"
+                size_bytes = os.path.getsize(csv_path)
             else:
-                source = csv_file
+                fill = _EMPTY_FILL
+                notes = "CSV expected but missing on disk"
         elif "PostgreSQL.Database" in part_expr:
             kind = "PostgreSQL"
-            source = "DB connection (see M)"
+            notes = "Loads from external PG database (see M expression)"
         elif part_expr.strip().startswith("ROW("):
             kind = "Calculated (Parameters)"
-            source = "DAX ROW(...)"
+            notes = "DAX ROW(...) — Tableau parameters"
         else:
             kind = "Calculated / other"
-            source = (part_expr[:60] + "…") if len(part_expr) > 60 else part_expr
+            notes = (part_expr[:100] + "…") if len(part_expr) > 100 else part_expr
 
-        # Match tableau source
-        tab_src = "(derived)" if name not in ds_by_caption else name
-        rows.append([tab_src, name, str(n_cols), kind, source])
+        tab_src = name if name in ds_by_caption else "(derived)"
+        data_rows.append([tab_src, name, n_cols, kind, source_file, size_bytes, notes])
+        row_fills.append(fill)
 
-    out = _header(2, "Data model — Tableau datasources → PBI tables") + _table(rows)
+    _write_table(ws, row, headers, data_rows, row_fills)
+    _autosize_columns(ws, start_row=row)
 
-    # Relationships
-    rels = model.get("relationships", []) or []
-    if rels:
-        rrows = [["From", "To", "Cardinality", "Direction", "Active"]]
-        for r in rels:
-            frm = f'{r.get("fromTable","")}[{r.get("fromColumn","")}]'
-            to = f'{r.get("toTable","")}[{r.get("toColumn","")}]'
-            card_from = r.get("fromCardinality", "")
-            card_to = r.get("toCardinality", "")
-            card = f"{card_from or 'many'} → {card_to or 'one'}"
-            direction = r.get("crossFilteringBehavior",
-                              "oneDirection") or "oneDirection"
-            active = "yes" if r.get("isActive", True) else "no"
-            rrows.append([frm, to, card, direction, active])
-        out += _header(3, "Relationships") + _table(rrows)
+
+def _sheet_relationships(wb, bim):
+    ws = wb.create_sheet("Relationships")
+    row = _write_title(ws, "Relationships", "Model relationships emitted into model.bim")
+
+    rels = (bim.get("model", {}) if bim else {}).get("relationships", []) or []
+    headers = ["From Table", "From Column", "To Table", "To Column",
+               "From Card.", "To Card.", "Direction", "Active"]
+    data_rows = []
+    row_fills = []
+
+    for r in rels:
+        active = r.get("isActive", True)
+        data_rows.append([
+            r.get("fromTable", ""),
+            r.get("fromColumn", ""),
+            r.get("toTable", ""),
+            r.get("toColumn", ""),
+            r.get("fromCardinality", "many"),
+            r.get("toCardinality", "one"),
+            r.get("crossFilteringBehavior", "oneDirection") or "oneDirection",
+            "yes" if active else "no",
+        ])
+        row_fills.append(None if active else _WARN_FILL)
+
+    _write_table(ws, row, headers, data_rows, row_fills)
+    _autosize_columns(ws, start_row=row)
+
+
+def _sheet_visual_mapping(wb, visual_map, ws_contexts):
+    """One row per Tableau worksheet's field-role assignment.
+
+    Filtering by "PBI Visual Type" or "Role" makes it easy to audit
+    "all my cards", "all my maps", etc.
+    """
+    ws = wb.create_sheet("Visual Mapping")
+    row = _write_title(
+        ws, "Visual mapping — Tableau worksheets → Power BI visuals",
+        "One row per field-role assignment. Filter by PBI Visual Type or Role to audit by category.",
+    )
+
+    ctx_by_name = {c.get("name", ""): c for c in (ws_contexts or [])}
+
+    headers = ["#", "Tableau Worksheet", "Tableau Mark", "Shelf Structure",
+               "PBI Visual Type", "Role", "Table", "Column", "Is Measure?",
+               "Aggregation"]
+    data_rows = []
+    row_fills = []
+
+    ordered = list((visual_map or {}).keys()) + [
+        n for n in ctx_by_name if n not in (visual_map or {})
+    ]
+    seen = set()
+    ordered = [n for n in ordered if not (n in seen or seen.add(n))]
+
+    for i, ws_name in enumerate(ordered, start=1):
+        ctx = ctx_by_name.get(ws_name, {})
+        mark = ", ".join(ctx.get("mark_types", []) or []) or "—"
+        shelf = ctx.get("shelf_structure") or ""
+        if not isinstance(shelf, str):
+            n_rows = len(ctx.get("rows_fields") or [])
+            n_cols = len(ctx.get("cols_fields") or [])
+            shelf = f"rows({n_rows}) × cols({n_cols})"
+
+        vis = (visual_map or {}).get(ws_name)
+        if not vis:
+            data_rows.append([i, ws_name, mark, shelf,
+                              "(skipped)", "—", "—", "—", "—", "—"])
+            row_fills.append(_EMPTY_FILL)
+            continue
+
+        vtype = vis.get("visualType", "")
+        assignments = _list_field_assignments(vis)
+        if not assignments:
+            data_rows.append([i, ws_name, mark, shelf, vtype,
+                              "(no fields)", "—", "—", "—", "—"])
+            row_fills.append(_WARN_FILL)
+            continue
+
+        for j, a in enumerate(assignments):
+            data_rows.append([
+                i if j == 0 else "",
+                ws_name if j == 0 else "",
+                mark if j == 0 else "",
+                shelf if j == 0 else "",
+                vtype if j == 0 else "",
+                a["role"], a["table"], a["column"],
+                "yes" if a["is_measure"] else "no",
+                a["aggregation"],
+            ])
+            row_fills.append(None)
+
+    _write_table(ws, row, headers, data_rows, row_fills)
+    _autosize_columns(ws, start_row=row)
+
+
+def _list_field_assignments(single_visual):
+    """Extract (role, table, column, is_measure, aggregation) tuples."""
+    out = []
+
+    # Preferred: projections + prototypeQuery.Select give us roles + bindings.
+    projections = single_visual.get("projections", {}) or {}
+    pq = single_visual.get("prototypeQuery", {}) or {}
+    selects = pq.get("Select", []) or []
+
+    # Map queryRef -> select spec to resolve role -> field binding
+    select_by_ref = {}
+    for s in selects:
+        if not isinstance(s, dict):
+            continue
+        name = s.get("Name", "")
+        if name:
+            select_by_ref[name] = s
+
+    for role, items in projections.items():
+        for it in (items or []):
+            qref = it.get("queryRef", "")
+            spec = select_by_ref.get(qref, {})
+            entry = _describe_select(spec, fallback_ref=qref)
+            entry["role"] = role
+            out.append(entry)
+
+    # Fallback: no projections — walk selects and use role hints on the select.
+    if not out and selects:
+        for s in selects:
+            entry = _describe_select(s)
+            if entry["column"]:
+                out.append(entry)
+
     return out
 
 
-def _section_visuals(visual_map, ws_contexts):
-    """Tableau worksheet / mark -> PBI visualType + field roles."""
-    if not visual_map and not ws_contexts:
-        return ""
-
-    # ws_context lookup
-    ctx_by_name = {c.get("name", ""): c for c in (ws_contexts or [])}
-
-    rows = [[
-        "#", "Tableau Worksheet", "Tableau Mark",
-        "Rows × Cols", "PBI Visual", "Field Assignments",
-    ]]
-
-    # Stable order: first in visual_map order, then any ws only in context
-    ordered_names = []
-    seen = set()
-    for n in visual_map or {}:
-        if n not in seen:
-            ordered_names.append(n)
-            seen.add(n)
-    for n in ctx_by_name:
-        if n not in seen:
-            ordered_names.append(n)
-            seen.add(n)
-
-    for i, ws_name in enumerate(ordered_names, start=1):
-        ctx = ctx_by_name.get(ws_name, {})
-        mark = ", ".join(ctx.get("mark_types", []) or []) or "-"
-        # shelf_structure in the context is a pre-formatted string like
-        # "rows(1D,0M) cols(0D,1M)" — use it verbatim. Fall back to counting
-        # shelf fields if it's missing.
-        shelf = ctx.get("shelf_structure")
-        if isinstance(shelf, str) and shelf:
-            shelf_desc = shelf
-        else:
-            n_rows = len(ctx.get("rows_fields") or [])
-            n_cols = len(ctx.get("cols_fields") or [])
-            shelf_desc = f"rows({n_rows}) × cols({n_cols})"
-
-        vis = (visual_map or {}).get(ws_name)
-        vtype, roles = _describe_visual(vis)
-
-        rows.append([str(i), ws_name, mark, shelf_desc, vtype,
-                     _truncate(roles, 200)])
-
-    return _header(2, "Visual mapping — Tableau worksheets → Power BI visuals") + \
-        _table(rows)
-
-
-def _describe_visual(single_visual):
-    """Return (visualType, human-readable field-role summary)."""
-    if not single_visual:
-        return "(skipped)", ""
-    vtype = single_visual.get("visualType", "")
-    # prototypeQuery.Select carries the actual field bindings
-    try:
-        pq = single_visual.get("prototypeQuery", {})
-        selects = pq.get("Select", []) or []
-    except Exception:
-        selects = []
-    parts = []
-    for s in selects:
-        role = ", ".join(s.get("_as_role", []) or []) if isinstance(s, dict) else ""
-        # The role hint lives in the projections mapping, so we fall back
-        # to pulling the raw column/measure name from the select spec.
-        spec = _fmt_select(s)
-        if role:
-            parts.append(f"{role}: {spec}")
-        else:
-            parts.append(spec)
-
-    # If we couldn't reach selects, fall back to projections keys
-    if not parts:
-        try:
-            proj = (single_visual.get("projections", {}) or {})
-            for role, items in proj.items():
-                for it in items or []:
-                    parts.append(f"{role}: {it.get('queryRef','')}")
-        except Exception:
-            pass
-    if not parts:
-        # Last-ditch: peek at vc.config for role names at least
-        parts = ["(see report.json)"]
-    return vtype, "; ".join(parts)
-
-
-def _fmt_select(s):
-    """Best-effort rendering of one Select entry into `Table[Col]` or `Agg(Table[Col])`."""
+def _describe_select(s, fallback_ref=""):
+    """Return {role, table, column, is_measure, aggregation} best-effort."""
+    entry = {"role": "", "table": "", "column": "", "is_measure": False,
+             "aggregation": ""}
     if not isinstance(s, dict):
-        return str(s)
+        if fallback_ref:
+            entry["column"] = fallback_ref
+        return entry
     try:
         if "Aggregation" in s:
             agg = s["Aggregation"]
             inner = agg.get("Expression", {}).get("Column", {})
-            tbl = inner.get("Expression", {}).get("SourceRef", {}).get("Entity", "")
-            col = inner.get("Property", "")
+            entry["table"] = inner.get("Expression", {}).get(
+                "SourceRef", {}).get("Entity", "")
+            entry["column"] = inner.get("Property", "")
             code = agg.get("Function", -1)
-            name = _AGG_NAME_BY_CODE.get(code, f"Agg{code}")
-            return f"{name}({tbl}[{col}])"
+            entry["aggregation"] = _AGG_NAME_BY_CODE.get(code, f"Agg{code}" if code != -1 else "")
+            entry["is_measure"] = False
+            return entry
         if "Column" in s:
             c = s["Column"]
-            tbl = c.get("Expression", {}).get("SourceRef", {}).get("Entity", "")
-            return f"{tbl}[{c.get('Property','')}]"
+            entry["table"] = c.get("Expression", {}).get(
+                "SourceRef", {}).get("Entity", "")
+            entry["column"] = c.get("Property", "")
+            entry["is_measure"] = False
+            return entry
         if "Measure" in s:
             m = s["Measure"]
-            tbl = m.get("Expression", {}).get("SourceRef", {}).get("Entity", "")
-            return f"{tbl}[{m.get('Property','')}] (measure)"
+            entry["table"] = m.get("Expression", {}).get(
+                "SourceRef", {}).get("Entity", "")
+            entry["column"] = m.get("Property", "")
+            entry["is_measure"] = True
+            return entry
     except Exception:
         pass
-    return json.dumps(s, separators=(",", ":"))[:80]
+    if fallback_ref:
+        entry["column"] = fallback_ref
+    return entry
 
 
-def _section_dashboards(pages, db_contexts):
-    if not pages and not db_contexts:
-        return ""
-    rows = [["Tableau Dashboard", "PBI Page", "Visuals", "Slicers / Filters",
-             "Text / Images"]]
-    db_by_name = {d.get("name", ""): d for d in (db_contexts or [])}
+def _sheet_dashboards(wb, pages, db_contexts):
+    ws = wb.create_sheet("Dashboards")
+    row = _write_title(
+        ws, "Dashboards → Report pages",
+        "Per-page counts of chart visuals, slicers, text boxes, and images.",
+    )
+
+    headers = ["Tableau Dashboard", "PBI Page", "Chart Visuals",
+               "Slicers", "Text Boxes", "Images", "Notes"]
+    data_rows = []
+    row_fills = []
+    covered = set()
 
     for p in pages or []:
         disp = p.get("displayName") or p.get("name", "")
+        covered.add(disp)
         vcs = p.get("visualContainers", []) or []
-        n_vis = 0
-        n_slicer = 0
-        n_text = 0
-        n_img = 0
+        n_vis = n_slicer = n_text = n_img = 0
         for vc in vcs:
             cfg_raw = vc.get("config", "")
-            cfg = {}
             try:
                 cfg = json.loads(cfg_raw) if isinstance(cfg_raw, str) else cfg_raw
             except Exception:
-                pass
+                cfg = {}
             sv = cfg.get("singleVisual", {}) if isinstance(cfg, dict) else {}
             vt = sv.get("visualType", "")
             if vt == "slicer":
@@ -329,82 +463,90 @@ def _section_dashboards(pages, db_contexts):
                 n_img += 1
             elif vt:
                 n_vis += 1
-        rows.append([
-            disp, disp,
-            str(n_vis), str(n_slicer), f"{n_text} text / {n_img} images",
-        ])
+        data_rows.append([disp, disp, n_vis, n_slicer, n_text, n_img, ""])
+        row_fills.append(None)
 
-    # Dashboards without a corresponding page
-    covered = {p.get("displayName") or p.get("name", "") for p in pages or []}
-    for name, ctx in db_by_name.items():
+    for db in (db_contexts or []):
+        name = db.get("name", "")
         if name in covered:
             continue
-        rows.append([name, "(not migrated)",
-                     str(len(ctx.get("zones", []) or [])), "-", "-"])
+        data_rows.append([name, "(not migrated)",
+                          len(db.get("zones", []) or []), 0, 0, 0,
+                          "Dashboard has no corresponding PBI page"])
+        row_fills.append(_WARN_FILL)
 
-    return _header(2, "Dashboards → Report pages") + _table(rows)
+    _write_table(ws, row, headers, data_rows, row_fills)
+    _autosize_columns(ws, start_row=row)
 
 
-def _section_calculations(metadata, bim):
-    """Show Tableau calculation → DAX expression mapping."""
+def _sheet_calculations(wb, metadata, bim):
+    ws = wb.create_sheet("Calculations")
+    row = _write_title(
+        ws, "Calculations — Tableau formulas → DAX",
+        "Each Tableau calc side-by-side with its generated DAX.",
+    )
+
     calcs = metadata.get("calculations", []) or []
-    if not calcs:
-        return ""
 
-    # Build a lookup caption → DAX expr from the bim tables
     dax_by_caption = {}
-    model = bim.get("model", {}) if bim else {}
-    for t in model.get("tables", []) or []:
+    for t in (bim.get("model", {}) if bim else {}).get("tables", []) or []:
         for m in t.get("measures", []) or []:
             n = m.get("name")
-            if n and n not in dax_by_caption:
-                dax_by_caption[n] = ("measure", m.get("expression", ""))
+            if n:
+                dax_by_caption.setdefault(n, ("measure", m.get("expression", ""), t.get("name", "")))
         for c in t.get("columns", []) or []:
             if c.get("type") == "calculated":
                 n = c.get("name")
-                if n and n not in dax_by_caption:
-                    dax_by_caption[n] = ("calc column", c.get("expression", ""))
+                if n:
+                    dax_by_caption.setdefault(n, ("calc column", c.get("expression", ""), t.get("name", "")))
 
-    rows = [["#", "Tableau Field", "Kind", "Tableau Formula", "DAX Expression"]]
+    headers = ["#", "Tableau Field", "Kind", "PBI Table",
+               "Tableau Formula", "DAX Expression"]
+    data_rows = []
+    row_fills = []
     for i, c in enumerate(calcs, start=1):
         caption = c.get("caption", c.get("name", ""))
-        formula = c.get("formula", "")
-        kind, dax = dax_by_caption.get(caption, ("", ""))
-        rows.append([
-            str(i),
-            caption,
-            kind or "-",
-            _truncate(formula, 140),
-            _truncate(dax, 160),
+        kind, dax, tbl = dax_by_caption.get(caption, ("(not emitted)", "", ""))
+        data_rows.append([
+            i, caption, kind, tbl,
+            (c.get("formula", "") or "").strip(),
+            (dax or "").strip(),
         ])
-    return _header(2, "Calculations — Tableau formulas → DAX") + _table(rows)
+        row_fills.append(_WARN_FILL if kind == "(not emitted)" else None)
+
+    _write_table(ws, row, headers, data_rows, row_fills)
+    # Formula + DAX columns wrap to ~90 chars
+    for letter in ("E", "F"):
+        ws.column_dimensions[letter].width = 90
+    _autosize_columns(ws, start_row=row, min_width=8, max_width=90)
 
 
-def _section_parameters(metadata, bim):
+def _sheet_parameters(wb, metadata):
     params = metadata.get("parameters", []) or []
     if not params:
-        return ""
-    rows = [["Name", "Data type", "Current value", "Allowable values"]]
+        return
+    ws = wb.create_sheet("Parameters")
+    row = _write_title(ws, "Parameters",
+                       "Tableau parameters carried over as measures in the Parameters table.")
+
+    headers = ["Name", "Data type", "Current value", "Allowable values"]
+    data_rows = []
     for p in params:
         allow = p.get("allowable_values") or []
-        if isinstance(allow, list) and len(allow) > 6:
-            allow = allow[:6] + ["…"]
-        rows.append([
-            p.get("name", ""),
-            p.get("datatype", ""),
-            str(p.get("current_value", "")),
-            ", ".join(str(a) for a in allow) if isinstance(allow, list) else str(allow),
+        if isinstance(allow, list):
+            if len(allow) > 10:
+                allow_str = ", ".join(str(a) for a in allow[:10]) + f"  (+{len(allow) - 10} more)"
+            else:
+                allow_str = ", ".join(str(a) for a in allow)
+        else:
+            allow_str = str(allow)
+        data_rows.append([
+            p.get("name", ""), p.get("datatype", ""),
+            str(p.get("current_value", "")), allow_str,
         ])
-    return _header(2, "Parameters") + _table(rows)
 
-
-def _section_warnings(warnings):
-    if not warnings:
-        return ""
-    out = _header(2, "Warnings & notes")
-    for w in warnings:
-        out += f"- {_esc(w)}\n"
-    return out + "\n"
+    _write_table(ws, row, headers, data_rows)
+    _autosize_columns(ws, start_row=row)
 
 
 # ---------------------------------------------------------------------
@@ -425,35 +567,37 @@ def generate_migration_report(
     warnings=None,
     stats=None,
 ):
-    """Write ``output_dir/migration_report.md`` and return its path.
+    """Write ``output_dir/migration_report.xlsx`` and return its path.
 
-    All arguments except ``output_dir`` / ``workbook_name`` /
-    ``metadata`` / ``bim`` are optional; missing sections are simply
-    omitted rather than raising.
+    Missing optional data (e.g. ``visual_map=None``) results in the
+    corresponding sheet being omitted rather than raising.
     """
     os.makedirs(output_dir, exist_ok=True)
-
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    md = []
-    md.append(_header(1, f"Migration report — {workbook_name}"))
-    md.append(f"**Source workbook:** `{input_path or '(unknown)'}`  \n")
-    md.append(f"**Generated:** {now}  \n")
-    md.append(f"**Target:** Power BI (PBIP / model.bim)  \n\n")
 
-    md.append(_section_summary(
-        workbook_name, input_path, metadata, bim, visual_map, pages,
-        db_contexts, stats,
-    ))
-    md.append(_section_data_model(metadata, bim, csv_dir))
-    md.append(_section_visuals(visual_map, ws_contexts))
-    md.append(_section_dashboards(pages, db_contexts))
-    md.append(_section_calculations(metadata, bim))
-    md.append(_section_parameters(metadata, bim))
-    md.append(_section_warnings(warnings))
+    wb = Workbook()
+    # Remove the default blank sheet — we'll create named sheets.
+    wb.remove(wb.active)
 
-    md.append("\n---\n_Generated by TabToPBI migration pipeline._\n")
+    _sheet_summary(wb, workbook_name, input_path, metadata, bim, visual_map,
+                   pages, db_contexts, stats, now)
+    _sheet_data_model(wb, metadata, bim, csv_dir)
+    _sheet_relationships(wb, bim)
+    if visual_map or ws_contexts:
+        _sheet_visual_mapping(wb, visual_map, ws_contexts)
+    if pages or db_contexts:
+        _sheet_dashboards(wb, pages, db_contexts)
+    _sheet_calculations(wb, metadata, bim)
+    _sheet_parameters(wb, metadata)
 
-    path = os.path.join(output_dir, "migration_report.md")
-    with open(path, "w", encoding="utf-8") as f:
-        f.write("".join(md))
+    if warnings:
+        ws = wb.create_sheet("Warnings")
+        _write_title(ws, "Warnings & notes",
+                     "Pipeline observations worth surfacing to a reviewer.")
+        _write_table(ws, 3, ["#", "Message"],
+                     [[i + 1, _normalise(w)] for i, w in enumerate(warnings)])
+        _autosize_columns(ws, start_row=3)
+
+    path = os.path.join(output_dir, "migration_report.xlsx")
+    wb.save(path)
     return path
