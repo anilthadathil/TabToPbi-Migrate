@@ -1017,16 +1017,52 @@ def generate_bim(metadata, csv_dir, pg_config=None):
                 )
         else:
             # CSV M expression
-            csv_path = os.path.join(csv_dir, f"{table_name}.csv").replace("\\", "\\\\")
-            m_expr = (
-                f'let\n'
-                f'    Source = Csv.Document(File.Contents("{csv_path}"), '
-                f'[Delimiter=",", Encoding=65001, QuoteStyle=QuoteStyle.Csv]),\n'
-                f'    Headers = Table.PromoteHeaders(Source, [PromoteAllScalars=true]),\n'
-                f'    Types = Table.TransformColumnTypes(Headers, {{{m_type_transforms}}})\n'
-                f'in\n'
-                f'    Types'
-            )
+            csv_abs = os.path.join(csv_dir, f"{table_name}.csv")
+            csv_path = csv_abs.replace("\\", "\\\\")
+            if os.path.exists(csv_abs):
+                m_expr = (
+                    f'let\n'
+                    f'    Source = Csv.Document(File.Contents("{csv_path}"), '
+                    f'[Delimiter=",", Encoding=65001, QuoteStyle=QuoteStyle.Csv]),\n'
+                    f'    Headers = Table.PromoteHeaders(Source, [PromoteAllScalars=true]),\n'
+                    f'    Types = Table.TransformColumnTypes(Headers, {{{m_type_transforms}}})\n'
+                    f'in\n'
+                    f'    Types'
+                )
+            else:
+                # CSV is missing — happens for logical-wrapper datasources that
+                # have no single physical extract (Tableau "Multiple Connections"
+                # blends and parents of multi-table object-graphs). Emit an empty
+                # table with the declared schema so PBI Desktop can load the
+                # model without a File-not-found error. Calculated columns and
+                # measures attached to this table still evaluate against the
+                # other (populated) tables via fully-qualified references;
+                # physical columns just resolve as BLANK over zero rows.
+                # Inside `type table [...]` we need a bare type (text, number,
+                # Int64.Type, ...), NOT a type ascription (`type text`).
+                # `_M_TYPE_MAP` is tuned for `Table.TransformColumnTypes` and
+                # carries the `type ` prefix — strip it here.
+                def _bare_type(dt):
+                    t = _M_TYPE_MAP.get(dt, "type text")
+                    return t[5:] if t.startswith("type ") else t
+                schema_parts = ", ".join(
+                    f'#"{c["name"]}" = {_bare_type(c["datatype"])}'
+                    for c in cols
+                )
+                if not schema_parts:
+                    # No declared columns at all — defensive fallback.
+                    m_expr = 'let\n    Source = #table({}, {})\nin\n    Source'
+                else:
+                    m_expr = (
+                        f'let\n'
+                        f'    Source = #table(type table [{schema_parts}], {{}})\n'
+                        f'in\n'
+                        f'    Source'
+                    )
+                print(
+                    f"       [LOG] Missing CSV for '{table_name}' — "
+                    f"emitting empty-schema M table (logical-wrapper / blend)."
+                )
 
         # TOM columns
         tom_columns = []
