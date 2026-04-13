@@ -65,6 +65,126 @@ _AGG_NAME_BY_CODE = {
 
 
 # ---------------------------------------------------------------------
+# Mapping fidelity classifier
+# ---------------------------------------------------------------------
+#
+# Three categories:
+#   DIRECT        — Tableau construct has a 1:1 equivalent in PBI; migration
+#                   should look and behave the same without tweaking.
+#   SIMILAR       — PBI has a close approximation, but styling / encoding
+#                   semantics differ enough that a human should eyeball it.
+#   NOT_AVAILABLE — No native PBI equivalent; the visual needs to be
+#                   rebuilt (custom visual, redesign, or replace with a
+#                   different chart type).
+#
+# A reviewer only has to look at SIMILAR + NOT_AVAILABLE — those are the
+# "manual review" buckets surfaced in the Summary and Manual Review sheets.
+
+# PBI visuals that are a straight equivalent of a standard Tableau mark.
+_DIRECT_VISUALS = {
+    "clusteredBarChart", "clusteredColumnChart",
+    "stackedBarChart", "stackedColumnChart",
+    "hundredPercentStackedBarChart", "hundredPercentStackedColumnChart",
+    "barChart", "columnChart",          # legacy aliases
+    "lineChart",
+    "areaChart", "stackedAreaChart", "hundredPercentStackedAreaChart",
+    "pieChart", "donutChart",
+    "scatterChart",
+    "tableEx", "pivotTable",
+    "matrix",
+    "card", "multiRowCard", "kpi",
+    "textbox",
+    "slicer",
+    "image",
+}
+
+# PBI visuals that approximate but do not perfectly reproduce Tableau
+# behavior — always flag for review.
+_SIMILAR_VISUALS = {
+    "map", "filledMap", "shapeMap",
+    "treemap",
+    "lineClusteredColumnComboChart", "lineStackedColumnComboChart",
+    "gauge",
+    "funnel",
+    "waterfall",
+    "ribbonChart",
+    "basicShape",
+    "histogram",
+}
+
+# Tableau mark types with no native PBI equivalent. Presence of any of
+# these in the worksheet context overrides the visualType classification.
+_NOT_AVAILABLE_MARKS = {
+    "GanttBar",          # Gantt bars — no native PBI Gantt
+    "Polygon",           # Custom polygon marks (not geographic Multipolygon)
+    "CircleView",        # Packed bubbles / circle views
+    "PackedBubble",
+    "Boxplot",
+}
+
+# Tableau marks that, even when mapped to a valid PBI visual, retain
+# styling / encoding nuances the automated pipeline cannot fully carry.
+# Forces a SIMILAR classification.
+_REVIEW_MARKS = {
+    "Shape",             # Custom shapes lost
+    "Square",            # Heatmap / density — color ramp differs
+    "Circle",            # Bubble / packed-bubble nuances
+    "Multipolygon",      # Geographic fill style differs slightly
+    "Automatic",         # Tableau auto-inference — verify PBI picked right
+}
+
+
+def _classify_mapping(marks, vtype):
+    """Return ``(category, reason)`` for one worksheet's mapping.
+
+    ``marks`` is the list of Tableau mark types on the worksheet;
+    ``vtype`` is the PBI visualType chosen by the visual migrator.
+    ``category`` ∈ ``{"DIRECT", "SIMILAR", "NOT_AVAILABLE"}``.
+    ``reason`` is a short note suitable for the report cell.
+    """
+    marks = [m for m in (marks or []) if m]
+    if not vtype or vtype == "(skipped)":
+        return ("NOT_AVAILABLE",
+                "No PBI visual was produced — the visual migrator could "
+                "not map this worksheet.")
+
+    # Any mark with no PBI equivalent wins.
+    for m in marks:
+        if m in _NOT_AVAILABLE_MARKS:
+            return ("NOT_AVAILABLE",
+                    f"Tableau '{m}' mark has no native Power BI equivalent "
+                    f"— rebuild with a custom visual.")
+
+    # Unrecognised PBI type → treat as SIMILAR to be safe.
+    if vtype not in _DIRECT_VISUALS and vtype not in _SIMILAR_VISUALS:
+        return ("SIMILAR",
+                f"Uncommon PBI visualType '{vtype}' — verify against "
+                f"Tableau intent.")
+
+    if vtype in _SIMILAR_VISUALS:
+        return ("SIMILAR",
+                f"PBI '{vtype}' is the closest equivalent but usually "
+                f"needs styling / encoding tweaks.")
+
+    # Mark-driven review flag even when the PBI side is "direct".
+    for m in marks:
+        if m in _REVIEW_MARKS:
+            return ("SIMILAR",
+                    f"Tableau '{m}' mark mapped to '{vtype}' — review "
+                    f"the encoding / styling fidelity.")
+
+    return ("DIRECT", "Standard 1:1 mapping.")
+
+
+# Row-shading colours per category.
+_CAT_FILL = {
+    "DIRECT":        PatternFill("solid", fgColor="E2F0D9"),   # soft green
+    "SIMILAR":       PatternFill("solid", fgColor="FFF3CD"),   # soft yellow
+    "NOT_AVAILABLE": PatternFill("solid", fgColor="F8D7DA"),   # soft red
+}
+
+
+# ---------------------------------------------------------------------
 # Sheet writing helpers
 # ---------------------------------------------------------------------
 
@@ -146,8 +266,31 @@ def _normalise(val):
 # Section builders — each writes to its own sheet.
 # ---------------------------------------------------------------------
 
+def _classify_all_visuals(visual_map, ws_contexts):
+    """Return ``[(worksheet_name, marks, vtype, category, reason), ...]``
+    in a stable order, classifying every worksheet in ``visual_map`` +
+    any that only appear in ``ws_contexts``.
+    """
+    ctx_by_name = {c.get("name", ""): c for c in (ws_contexts or [])}
+    ordered = list((visual_map or {}).keys()) + [
+        n for n in ctx_by_name if n not in (visual_map or {})
+    ]
+    seen = set()
+    ordered = [n for n in ordered if not (n in seen or seen.add(n))]
+
+    out = []
+    for ws_name in ordered:
+        ctx = ctx_by_name.get(ws_name, {})
+        marks = ctx.get("mark_types", []) or []
+        vis = (visual_map or {}).get(ws_name)
+        vtype = (vis.get("visualType", "") if vis else "(skipped)") or "(skipped)"
+        category, reason = _classify_mapping(marks, vtype)
+        out.append((ws_name, marks, vtype, category, reason))
+    return out
+
+
 def _sheet_summary(wb, workbook_name, input_path, metadata, bim, visual_map,
-                   pages, db_contexts, stats, now):
+                   pages, db_contexts, stats, now, classification=None):
     ws = wb.create_sheet("Summary")
     row = _write_title(
         ws,
@@ -185,6 +328,50 @@ def _sheet_summary(wb, workbook_name, input_path, metadata, bim, visual_map,
     ]
     _write_table(ws, row, headers, [[_normalise(c) for c in r] for r in rows])
 
+    # -----------------------------------------------------------------
+    # Visual mapping fidelity breakdown + manual-review callout.
+    # -----------------------------------------------------------------
+    if classification:
+        from collections import Counter
+        counts = Counter(c[3] for c in classification)
+        total = len(classification)
+        direct = counts.get("DIRECT", 0)
+        similar = counts.get("SIMILAR", 0)
+        no_eq = counts.get("NOT_AVAILABLE", 0)
+        review = similar + no_eq
+
+        row_cat = ws.max_row + 3
+        ws.cell(row=row_cat, column=1,
+                value="Visual mapping fidelity").font = _TITLE_FONT
+        cat_rows = [
+            ["Direct mapping (1:1 — no review needed)",      direct, _pct(direct, total)],
+            ["Similar mapping (manual review suggested)",    similar, _pct(similar, total)],
+            ["No direct mapping (rebuild required)",         no_eq, _pct(no_eq, total)],
+            ["TOTAL",                                         total, "100%"],
+        ]
+        fills = [
+            _CAT_FILL["DIRECT"],
+            _CAT_FILL["SIMILAR"],
+            _CAT_FILL["NOT_AVAILABLE"],
+            None,
+        ]
+        _write_table(
+            ws, row_cat + 1,
+            ["Category", "Count", "Share"],
+            cat_rows, row_fills=fills,
+        )
+
+        # Callout row if anything needs review.
+        if review > 0:
+            row_note = ws.max_row + 2
+            note = (f"→ {review} of {total} visuals require manual review. "
+                    f"See the 'Manual Review' sheet for the focused list.")
+            cell = ws.cell(row=row_note, column=1, value=note)
+            cell.font = Font(bold=True, color="9C5700")
+            cell.fill = _WARN_FILL
+            ws.merge_cells(start_row=row_note, start_column=1,
+                           end_row=row_note, end_column=3)
+
     # Pipeline stats block below
     if stats:
         row2 = ws.max_row + 3
@@ -195,6 +382,12 @@ def _sheet_summary(wb, workbook_name, input_path, metadata, bim, visual_map,
         )
 
     _autosize_columns(ws, start_row=3)
+
+
+def _pct(n, total):
+    if not total:
+        return "0%"
+    return f"{(n * 100 / total):.0f}%"
 
 
 def _sheet_data_model(wb, metadata, bim, csv_dir):
@@ -286,31 +479,38 @@ def _sheet_relationships(wb, bim):
     _autosize_columns(ws, start_row=row)
 
 
-def _sheet_visual_mapping(wb, visual_map, ws_contexts):
-    """One row per Tableau worksheet's field-role assignment.
+def _sheet_visual_mapping(wb, visual_map, ws_contexts, classification):
+    """One row per Tableau worksheet's field-role assignment, plus two
+    columns classifying the mapping fidelity so reviewers can filter.
 
-    Filtering by "PBI Visual Type" or "Role" makes it easy to audit
-    "all my cards", "all my maps", etc.
+    Filtering by ``Mapping Fidelity = SIMILAR`` or ``NOT_AVAILABLE`` gives
+    you the manual-review worklist. ``classification`` is the list
+    produced by ``_classify_all_visuals``.
     """
     ws = wb.create_sheet("Visual Mapping")
     row = _write_title(
         ws, "Visual mapping — Tableau worksheets → Power BI visuals",
-        "One row per field-role assignment. Filter by PBI Visual Type or Role to audit by category.",
+        "One row per field-role. Filter 'Mapping Fidelity' to see "
+        "DIRECT / SIMILAR (manual review) / NOT_AVAILABLE (rebuild).",
     )
 
     ctx_by_name = {c.get("name", ""): c for c in (ws_contexts or [])}
+    cat_by_name = {c[0]: (c[3], c[4]) for c in (classification or [])}
 
     headers = ["#", "Tableau Worksheet", "Tableau Mark", "Shelf Structure",
-               "PBI Visual Type", "Role", "Table", "Column", "Is Measure?",
-               "Aggregation"]
+               "PBI Visual Type", "Mapping Fidelity", "Review Note",
+               "Role", "Table", "Column", "Is Measure?", "Aggregation"]
     data_rows = []
     row_fills = []
 
-    ordered = list((visual_map or {}).keys()) + [
-        n for n in ctx_by_name if n not in (visual_map or {})
-    ]
-    seen = set()
-    ordered = [n for n in ordered if not (n in seen or seen.add(n))]
+    # Use the same ordering as classification so the two views line up.
+    ordered = [c[0] for c in (classification or [])]
+    if not ordered:
+        ordered = list((visual_map or {}).keys()) + [
+            n for n in ctx_by_name if n not in (visual_map or {})
+        ]
+        seen = set()
+        ordered = [n for n in ordered if not (n in seen or seen.add(n))]
 
     for i, ws_name in enumerate(ordered, start=1):
         ctx = ctx_by_name.get(ws_name, {})
@@ -321,19 +521,24 @@ def _sheet_visual_mapping(wb, visual_map, ws_contexts):
             n_cols = len(ctx.get("cols_fields") or [])
             shelf = f"rows({n_rows}) × cols({n_cols})"
 
+        category, reason = cat_by_name.get(ws_name, ("", ""))
+        cat_fill = _CAT_FILL.get(category)
+
         vis = (visual_map or {}).get(ws_name)
         if not vis:
             data_rows.append([i, ws_name, mark, shelf,
-                              "(skipped)", "—", "—", "—", "—", "—"])
-            row_fills.append(_EMPTY_FILL)
+                              "(skipped)", category, reason,
+                              "—", "—", "—", "—", "—"])
+            row_fills.append(cat_fill or _EMPTY_FILL)
             continue
 
         vtype = vis.get("visualType", "")
         assignments = _list_field_assignments(vis)
         if not assignments:
             data_rows.append([i, ws_name, mark, shelf, vtype,
+                              category, reason,
                               "(no fields)", "—", "—", "—", "—"])
-            row_fills.append(_WARN_FILL)
+            row_fills.append(cat_fill or _WARN_FILL)
             continue
 
         for j, a in enumerate(assignments):
@@ -343,11 +548,55 @@ def _sheet_visual_mapping(wb, visual_map, ws_contexts):
                 mark if j == 0 else "",
                 shelf if j == 0 else "",
                 vtype if j == 0 else "",
+                category if j == 0 else "",
+                reason if j == 0 else "",
                 a["role"], a["table"], a["column"],
                 "yes" if a["is_measure"] else "no",
                 a["aggregation"],
             ])
-            row_fills.append(None)
+            # Shade the first row of each worksheet group by category;
+            # subsequent field rows stay unshaded so the grouping is
+            # visually obvious.
+            row_fills.append(cat_fill if j == 0 else None)
+
+    _write_table(ws, row, headers, data_rows, row_fills)
+    _autosize_columns(ws, start_row=row)
+
+
+def _sheet_manual_review(wb, classification):
+    """Focused worklist of visuals that need a human eye.
+
+    Only includes SIMILAR + NOT_AVAILABLE entries — DIRECT visuals are
+    left out. Category is shaded, so a reviewer can sort by category and
+    work top-down.
+    """
+    non_direct = [c for c in (classification or []) if c[3] != "DIRECT"]
+    if not non_direct:
+        return
+
+    ws = wb.create_sheet("Manual Review")
+    row = _write_title(
+        ws, "Manual review — visuals that need a human",
+        f"{len(non_direct)} visuals are SIMILAR or NOT_AVAILABLE. "
+        "Sort by Category and walk top-down. DIRECT mappings are omitted.",
+    )
+
+    headers = ["#", "Tableau Worksheet", "Tableau Mark",
+               "PBI Visual Type", "Category", "Action", "Review Note"]
+    data_rows = []
+    row_fills = []
+    # NOT_AVAILABLE first (highest priority), then SIMILAR.
+    non_direct.sort(key=lambda c: (0 if c[3] == "NOT_AVAILABLE" else 1,
+                                   c[0].lower()))
+    for i, (name, marks, vtype, category, reason) in enumerate(non_direct, start=1):
+        action = ("Rebuild with custom visual"
+                  if category == "NOT_AVAILABLE"
+                  else "Review encoding / styling")
+        data_rows.append([
+            i, name, ", ".join(marks) if marks else "—",
+            vtype, category, action, reason,
+        ])
+        row_fills.append(_CAT_FILL.get(category))
 
     _write_table(ws, row, headers, data_rows, row_fills)
     _autosize_columns(ws, start_row=row)
@@ -579,12 +828,18 @@ def generate_migration_report(
     # Remove the default blank sheet — we'll create named sheets.
     wb.remove(wb.active)
 
+    # Compute fidelity classification once — the Summary, Visual Mapping,
+    # and Manual Review sheets all consume it.
+    classification = _classify_all_visuals(visual_map, ws_contexts) \
+        if (visual_map or ws_contexts) else []
+
     _sheet_summary(wb, workbook_name, input_path, metadata, bim, visual_map,
-                   pages, db_contexts, stats, now)
+                   pages, db_contexts, stats, now, classification=classification)
     _sheet_data_model(wb, metadata, bim, csv_dir)
     _sheet_relationships(wb, bim)
     if visual_map or ws_contexts:
-        _sheet_visual_mapping(wb, visual_map, ws_contexts)
+        _sheet_visual_mapping(wb, visual_map, ws_contexts, classification)
+        _sheet_manual_review(wb, classification)
     if pages or db_contexts:
         _sheet_dashboards(wb, pages, db_contexts)
     _sheet_calculations(wb, metadata, bim)
