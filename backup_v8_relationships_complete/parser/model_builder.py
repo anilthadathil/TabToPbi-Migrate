@@ -1,16 +1,3 @@
-"""Metadata envelope builder.
-
-Collects everything ``xml_parser`` extracts from a Tableau workbook into
-a single ``metadata`` dict. This dict is the canonical input to every
-downstream generator (``bim_generator``, ``pbi_generator``,
-``pbir_generator``, ``visual_migrator``), so every new piece of Tableau
-state we care about ends up here.
-
-Keys are stable and referenced by name across the codebase; adding a
-new key is safe but renaming one is a breaking change.
-"""
-
-
 def build_metadata(
     datasources,
     columns,

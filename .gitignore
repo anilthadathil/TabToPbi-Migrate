@@ -1,6 +1,18 @@
+# Python build artefacts
 __pycache__/
 *.pyc
+
+# Pipeline scratch / outputs (regenerated every run)
 temp/
 output/
-backup/
+
+# Hyper extracts (large, binary, recreatable from source TWBX)
 *.hyper
+
+# Claude Code per-user local permissions (not shared)
+.claude/
+parser/.claude/
+
+# Runtime logs
+hyperd.log
+*.log

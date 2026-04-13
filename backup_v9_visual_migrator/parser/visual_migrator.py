@@ -1,0 +1,1021 @@
+"""AI-driven visual migration from Tableau worksheets/dashboards to Power BI report.json.
+
+This module is a SEPARATE script that plugs into the existing semantic migration pipeline.
+It does NOT modify any existing parser files (xml_parser, bim_generator, etc.).
+
+Architecture:
+  1. DETERMINISTIC: Extract compact worksheet/dashboard contexts from TWB XML
+  2. AI-DRIVEN: Claude converts worksheet contexts → PBI visual definitions
+  3. AI-DRIVEN: Claude converts dashboard layouts → PBI page arrangements
+  4. DETERMINISTIC: Assemble final report.json pages
+
+Integration point: migrate.py calls `migrate_visuals(twb_root, metadata, bim_path)`
+which returns a list of page dicts for report.json (same interface as pbir_generator).
+"""
+
+import json
+import uuid
+import re
+import os
+import time
+import xml.etree.ElementTree as ET
+
+
+# ─────────────────────────────────────────────────────────
+# Constants
+# ─────────────────────────────────────────────────────────
+
+PBI_PAGE_WIDTH = 1280
+PBI_PAGE_HEIGHT = 720
+
+# Tableau derivation prefix → PBI aggregation info
+_DERIVATION_MAP = {
+    "sum": ("Sum", 0),
+    "avg": ("Average", 1),
+    "cnt": ("Count", 2),
+    "min": ("Min", 3),
+    "max": ("Max", 4),
+    "cntd": ("CountD", 5),
+    "ctd": ("CountD", 5),
+    "attr": ("Attr", None),   # ATTR → SELECTEDVALUE in PBI
+    "none": (None, None),      # dimension, no aggregation
+    "usr": (None, None),       # user calc — check if measure
+    "yr": ("Year", None),
+    "mn": ("Month", None),
+    "qr": ("Quarter", None),
+    "tmn": ("MonthTrunc", None),
+    "twk": ("WeekTrunc", None),
+    "tyr": ("YearTrunc", None),
+    "cum": ("RunningSum", None),
+    "pcto": ("PercentOfTotal", None),
+    "rank": ("Rank", None),
+    "fVal": ("Forecast", None),
+    "io": ("InOut", None),
+    "clct": ("Collect", None),
+}
+
+# Fields to skip
+_SKIP_FIELDS = {"Multiple Values", "Measure Names", ":Measure Names",
+                "Number of Records", "Latitude (generated)", "Longitude (generated)"}
+
+
+# ─────────────────────────────────────────────────────────
+# Phase 1: Deterministic Context Extraction from TWB XML
+# ─────────────────────────────────────────────────────────
+
+def _parse_shelf_ref(ref_text, ds_caption_map, field_name_map):
+    """Parse a Tableau shelf field reference into structured form.
+
+    Input: '[federated.xxx].[sum:Sales:qk]'
+    Output: {'table': 'Sample - Superstore', 'column': 'Sales',
+             'aggregation': 'Sum', 'agg_function': 0, 'derivation': 'sum',
+             'raw': '[federated.xxx].[sum:Sales:qk]'}
+    """
+    results = []
+    # Match [datasource].[column_instance] patterns
+    for ds_name, col_ref in re.findall(r"\[([^\[\]]+)\]\.\[([^\[\]]+)\]", ref_text or ""):
+        table = ds_caption_map.get(ds_name, ds_name)
+
+        # Parse derivation:FieldName:type
+        parts = col_ref.split(":")
+        if len(parts) >= 3:
+            derivation = parts[0]
+            type_suffix = parts[-1]
+            middle = parts[1:-1]
+            # Handle double derivation like rank:sum:Sales:qk
+            if len(middle) >= 2 and middle[0] in _DERIVATION_MAP:
+                col_name = ":".join(middle[1:])
+                derivation = middle[0]
+            else:
+                col_name = ":".join(middle)
+        elif len(parts) == 1:
+            derivation = "none"
+            col_name = parts[0]
+        else:
+            derivation = parts[0] if parts[0] in _DERIVATION_MAP else "none"
+            col_name = parts[-1]
+
+        # Resolve internal names to captions
+        col_name = field_name_map.get(col_name, col_name)
+
+        # Skip internal fields
+        if col_name in _SKIP_FIELDS or col_name.startswith(":"):
+            continue
+
+        # Get aggregation info
+        agg_name, agg_func = _DERIVATION_MAP.get(derivation, (None, None))
+
+        results.append({
+            "table": table,
+            "column": col_name,
+            "aggregation": agg_name,
+            "agg_function": agg_func,
+            "derivation": derivation,
+            "raw": f"[{ds_name}].[{col_ref}]",
+        })
+
+    return results
+
+
+def _extract_encoding(pane, tag, ds_caption_map, field_name_map):
+    """Extract an encoding channel (color, size, tooltip, etc.) from a pane."""
+    results = []
+    for enc in pane.findall(f"encodings/{tag}"):
+        col_ref = enc.attrib.get("column", "")
+        if col_ref:
+            parsed = _parse_shelf_ref(col_ref, ds_caption_map, field_name_map)
+            results.extend(parsed)
+    return results
+
+
+def extract_worksheet_context(ws, ds_caption_map, field_name_map):
+    """Extract a compact, AI-friendly context dict from a Tableau worksheet XML element.
+
+    This is DETERMINISTIC — just XML parsing into structured data.
+    The interpretation (what PBI visual to create) is done by Claude.
+    """
+    name = ws.attrib.get("name", "")
+
+    # Primary datasource
+    ds_elem = ws.find(".//view/datasources/datasource")
+    datasource = ""
+    if ds_elem is not None:
+        ds_name = ds_elem.attrib.get("name", "")
+        datasource = ds_caption_map.get(ds_name, ds_name)
+
+    # Rows and cols (shelf expressions)
+    rows_elem = ws.find(".//table/rows")
+    cols_elem = ws.find(".//table/cols")
+    rows_text = rows_elem.text if rows_elem is not None and rows_elem.text else ""
+    cols_text = cols_elem.text if cols_elem is not None and cols_elem.text else ""
+
+    rows_fields = _parse_shelf_ref(rows_text, ds_caption_map, field_name_map)
+    cols_fields = _parse_shelf_ref(cols_text, ds_caption_map, field_name_map)
+
+    # Detect dual axis (+ in shelf expression)
+    has_dual_axis = "+" in rows_text or "+" in cols_text
+
+    # Detect nesting (/ in shelf expression)
+    has_nesting = "/" in rows_text or "/" in cols_text
+
+    # Detect small multiples (* in shelf expression)
+    has_multiples = "*" in rows_text or "*" in cols_text
+
+    # All panes — mark types and encodings
+    panes = ws.findall(".//pane")
+    mark_types = []
+    all_encodings = {
+        "color": [], "size": [], "shape": [], "tooltip": [],
+        "text": [], "label": [], "detail": [], "lod": [], "path": [],
+    }
+
+    for pane in panes:
+        # Mark type
+        mark = pane.find("mark")
+        if mark is not None:
+            mc = mark.attrib.get("class", "")
+            if mc and mc not in mark_types:
+                mark_types.append(mc)
+
+        # Encodings
+        for channel in all_encodings:
+            parsed = _extract_encoding(pane, channel, ds_caption_map, field_name_map)
+            for p in parsed:
+                if p not in all_encodings[channel]:
+                    all_encodings[channel].append(p)
+
+    # Fallback mark type from worksheet-level
+    if not mark_types:
+        for mark in ws.findall(".//mark"):
+            mc = mark.attrib.get("class", "")
+            if mc and mc not in mark_types:
+                mark_types.append(mc)
+
+    # Reference lines
+    ref_lines = []
+    for rl in ws.findall(".//reference-line"):
+        ref_lines.append({
+            "formula": rl.attrib.get("formula", ""),
+            "scope": rl.attrib.get("scope", ""),
+            "label_type": rl.attrib.get("label-type", ""),
+            "fill_below": rl.attrib.get("fill-below", ""),
+        })
+
+    # Mark formatting from style rules
+    mark_format = {}
+    for sr in ws.findall(".//style-rule[@element='mark']"):
+        for fmt in sr.findall("format"):
+            attr = fmt.attrib.get("attr", "")
+            val = fmt.attrib.get("value", "")
+            if attr and val:
+                mark_format[attr] = val
+
+    # Worksheet title
+    title = name
+    title_elem = ws.find(".//layout-options/title/formatted-text/run")
+    if title_elem is not None and title_elem.text:
+        title = title_elem.text.strip()
+
+    # Filters
+    filters = []
+    for f in ws.findall(".//filter"):
+        col_ref = f.attrib.get("column", "")
+        parsed = _parse_shelf_ref(col_ref, ds_caption_map, field_name_map)
+        for p in parsed:
+            filters.append(p["column"])
+
+    # Measure Values pattern
+    measure_values = []
+    for f in ws.findall(".//filter"):
+        col_attr = f.attrib.get("column", "")
+        if ":Measure Names" in col_attr:
+            for gf in f.findall(".//groupfilter[@function='member']"):
+                member = gf.attrib.get("member", "").strip('"')
+                if member:
+                    parsed = _parse_shelf_ref(member, ds_caption_map, field_name_map)
+                    measure_values.extend(parsed)
+
+    # Check for map (generated lat/long)
+    is_map = False
+    full_shelf = rows_text + " " + cols_text
+    if "Latitude (generated)" in full_shelf or "Longitude (generated)" in full_shelf:
+        is_map = True
+    # Also check for spatial columns
+    for dep in ws.findall(".//datasource-dependencies"):
+        for col in dep.findall("column"):
+            if col.attrib.get("datatype") == "spatial":
+                is_map = True
+                break
+
+    # Compact output — only non-empty fields
+    ctx = {
+        "name": name,
+        "title": title,
+        "datasource": datasource,
+        "mark_types": mark_types,
+        "rows": [{"table": f["table"], "column": f["column"],
+                  "aggregation": f["aggregation"]} for f in rows_fields],
+        "cols": [{"table": f["table"], "column": f["column"],
+                  "aggregation": f["aggregation"]} for f in cols_fields],
+        "pane_count": len(panes),
+        "dual_axis": has_dual_axis,
+        "is_map": is_map,
+    }
+
+    # Add non-empty encodings
+    for channel, fields in all_encodings.items():
+        if fields:
+            ctx[channel] = [{"table": f["table"], "column": f["column"],
+                            "aggregation": f["aggregation"]} for f in fields]
+
+    if measure_values:
+        ctx["measure_values"] = [{"table": f["table"], "column": f["column"],
+                                  "aggregation": f["aggregation"]} for f in measure_values]
+    if filters:
+        ctx["filters"] = filters
+    if ref_lines:
+        ctx["reference_lines"] = ref_lines
+    if mark_format:
+        ctx["mark_format"] = mark_format
+
+    return ctx
+
+
+def extract_dashboard_context(db, ds_caption_map):
+    """Extract compact dashboard layout context from a Tableau dashboard XML element."""
+    name = db.attrib.get("name", "")
+
+    # Dashboard size
+    size_elem = db.find("size")
+    db_width = 1000  # default
+    db_height = 800
+    if size_elem is not None:
+        db_width = int(size_elem.attrib.get("maxwidth", size_elem.attrib.get("minwidth", "1000")))
+        db_height = int(size_elem.attrib.get("maxheight", size_elem.attrib.get("minheight", "800")))
+        # -1 means automatic — use defaults
+        if db_width <= 0:
+            db_width = 1000
+        if db_height <= 0:
+            db_height = 800
+
+    # Parse ALL zones (not just sheet zones)
+    zones = []
+    for zone in db.findall(".//zone"):
+        zone_type = zone.attrib.get("type-v2", "")
+        zone_name = zone.attrib.get("name", "")
+        w = zone.attrib.get("w", "")
+        h = zone.attrib.get("h", "")
+
+        if not w or not h:
+            continue
+
+        z = {
+            "x": int(zone.attrib.get("x", "0")),
+            "y": int(zone.attrib.get("y", "0")),
+            "w": int(w),
+            "h": int(h),
+        }
+
+        hidden = zone.attrib.get("hidden-by-user", "") == "true"
+        if hidden:
+            z["hidden"] = True
+
+        if zone_type == "" and zone_name:
+            # Worksheet zone
+            z["type"] = "sheet"
+            z["name"] = zone_name
+            z["show_title"] = zone.attrib.get("show-title", "true")
+        elif zone_type == "filter":
+            z["type"] = "filter"
+            z["name"] = zone_name
+            z["param"] = zone.attrib.get("param", "")
+            z["mode"] = zone.attrib.get("mode", "list")
+        elif zone_type == "paramctrl":
+            z["type"] = "paramctrl"
+            z["param"] = zone.attrib.get("param", "")
+            z["mode"] = zone.attrib.get("mode", "compact")
+        elif zone_type == "text":
+            z["type"] = "text"
+            text_runs = []
+            for run in zone.findall(".//formatted-text/run"):
+                if run.text:
+                    text_runs.append(run.text)
+            z["text"] = " ".join(text_runs)
+        elif zone_type == "bitmap":
+            z["type"] = "image"
+            z["param"] = zone.attrib.get("param", "")
+            z["is_scaled"] = zone.attrib.get("is-scaled", "0")
+        elif zone_type == "color":
+            z["type"] = "legend"
+            z["name"] = zone_name
+        elif zone_type == "title":
+            z["type"] = "title"
+        elif zone_type == "empty":
+            continue  # skip spacers
+        else:
+            continue  # skip layout containers
+
+        zones.append(z)
+
+    return {
+        "name": name,
+        "width": db_width,
+        "height": db_height,
+        "zones": zones,
+    }
+
+
+def extract_model_schema(metadata, bim_path=None):
+    """Build a compact model schema for Claude from metadata and/or bim.
+
+    Returns: {table_name: {"columns": [...], "measures": [...]}}
+    """
+    schema = {}
+
+    # From bim file if available (most accurate — includes corrected DAX)
+    if bim_path and os.path.exists(bim_path):
+        with open(bim_path, "r", encoding="utf-8") as f:
+            bim = json.load(f)
+        for t in bim.get("model", {}).get("tables", []):
+            tname = t["name"]
+            schema[tname] = {
+                "columns": [c["name"] for c in t.get("columns", [])
+                           if c.get("type") != "calculated" or c.get("name") == "RelKey"],
+                "measures": [m["name"] for m in t.get("measures", [])],
+            }
+        return schema
+
+    # Fallback: from metadata
+    for ds in metadata.get("datasources", []):
+        cap = ds.get("caption", "")
+        if cap and cap != "Parameters":
+            schema[cap] = {"columns": [], "measures": []}
+
+    for col in metadata.get("columns", []):
+        table = col.get("table", "")
+        name = col.get("caption", col.get("name", ""))
+        if not table or not name or table == "Parameters":
+            continue
+        if table not in schema:
+            schema[table] = {"columns": [], "measures": []}
+        if col.get("formula"):
+            schema[table]["measures"].append(name)
+        elif not col.get("is_parameter"):
+            if name not in schema[table]["columns"]:
+                schema[table]["columns"].append(name)
+
+    for calc in metadata.get("calculations", []):
+        table = calc.get("table", "")
+        name = calc.get("caption", calc.get("name", ""))
+        if table and name and table in schema:
+            if name not in schema[table]["measures"]:
+                schema[table]["measures"].append(name)
+
+    # Parameters
+    params = metadata.get("parameters", [])
+    if params:
+        schema["Parameters"] = {
+            "columns": [],
+            "measures": [p.get("name", "") for p in params if p.get("name")],
+        }
+
+    return schema
+
+
+# ─────────────────────────────────────────────────────────
+# Phase 2: AI-Driven Conversion (Claude calls)
+# ─────────────────────────────────────────────────────────
+
+def _call_claude(prompt, timeout=120, model=None):
+    """Call Claude CLI and return response text."""
+    import subprocess
+    try:
+        t0 = time.time()
+        cmd = "claude --print --output-format text"
+        if model:
+            cmd = f"claude --model {model} --print --output-format text"
+        r = subprocess.run(cmd, input=prompt, shell=True,
+                          capture_output=True, text=True, timeout=timeout,
+                          encoding="utf-8", errors="replace")
+        elapsed = time.time() - t0
+        if r.returncode != 0:
+            print(f"       [VIS] Claude FAILED rc={r.returncode} ({elapsed:.1f}s)")
+            return None
+        out = r.stdout.strip()
+        if not out:
+            print(f"       [VIS] Claude EMPTY response ({elapsed:.1f}s)")
+            return None
+        print(f"       [VIS] Claude OK ({elapsed:.1f}s, {len(out)} chars)")
+        return out
+    except subprocess.TimeoutExpired:
+        print(f"       [VIS] Claude TIMEOUT after {timeout}s")
+        return None
+    except Exception as e:
+        print(f"       [VIS] Claude ERROR: {e}")
+        return None
+
+
+_VISUAL_SYSTEM_PROMPT = """You are a Tableau-to-Power BI visual migration expert.
+Given Tableau worksheet contexts and a PBI model schema, decide the visual type and field-to-role assignments.
+
+RULES:
+1. Return ONLY valid JSON — no markdown, no backticks, no explanation.
+2. Column/measure names MUST exist in the model schema provided. Check carefully.
+3. visualType must be one of: clusteredBarChart, clusteredColumnChart, stackedBarChart,
+   lineChart, areaChart, stackedAreaChart, lineClusteredColumnComboChart,
+   scatterChart, pieChart, donutChart, treemap, map, filledMap,
+   card, multiRowCard, tableEx, matrix, kpi, gauge.
+4. For dual-axis worksheets, use lineClusteredColumnComboChart.
+5. For Automatic mark type, infer the best PBI visual from the shelf structure and data.
+6. For map worksheets (is_map=true), use map or filledMap.
+7. Each field assignment needs: table, column, role, and whether it's a measure (is_measure: true/false).
+8. For measures: set is_measure=true. For columns with aggregation (Sum, Count, etc): set agg_function (0=Sum,1=Avg,2=Count,3=Min,4=Max,5=CountD).
+9. PBI roles by visual type:
+   - bar/column/line/area: Category, Y, Series, Tooltips
+   - combo: Category, Y (column measures), Y2 (line measures), Series
+   - scatter: X, Y, Category (detail), Size, Series, Tooltips
+   - pie/donut: Category, Y, Tooltips
+   - treemap: Category, Y, Series, Tooltips
+   - map: Category (location), Size, Color, Tooltips
+   - filledMap: Location, Values, Tooltips
+   - card: Fields (single field)
+   - multiRowCard: Fields (multiple)
+   - tableEx: Values (all columns)
+   - matrix: Rows, Columns, Values
+10. Title should be the worksheet title or name."""
+
+
+def convert_worksheets_to_visuals(ws_contexts, model_schema, model="haiku"):
+    """Send worksheet contexts to Claude in batches and get PBI visual definitions.
+
+    Returns: {worksheet_name: singleVisual_dict}
+    """
+    if not ws_contexts:
+        return {}
+
+    results = {}
+    # Batch into chunks of 8 worksheets
+    chunk_size = 8
+    chunks = [ws_contexts[i:i+chunk_size] for i in range(0, len(ws_contexts), chunk_size)]
+
+    for ci, chunk in enumerate(chunks):
+        print(f"       [VIS] Visual batch {ci+1}/{len(chunks)}: {len(chunk)} worksheets")
+
+        prompt = (
+            "SYSTEM INSTRUCTIONS:\n" + _VISUAL_SYSTEM_PROMPT + "\n\n"
+            "MODEL SCHEMA (available tables, columns, measures):\n"
+            + json.dumps(model_schema, indent=1) + "\n\n"
+            "WORKSHEET CONTEXTS (decide visual type and field assignments for each):\n"
+            + json.dumps(chunk, indent=1) + "\n\n"
+            "Return a JSON object mapping worksheet name to its visual definition.\n"
+            "Format: {\"WorksheetName\": {\n"
+            "  \"visualType\": \"clusteredBarChart\",\n"
+            "  \"title\": \"Chart Title\",\n"
+            "  \"fields\": [\n"
+            "    {\"role\": \"Category\", \"table\": \"TableName\", \"column\": \"ColName\", \"is_measure\": false},\n"
+            "    {\"role\": \"Y\", \"table\": \"TableName\", \"column\": \"Sales\", \"is_measure\": false, \"agg_function\": 0},\n"
+            "    {\"role\": \"Y\", \"table\": \"TableName\", \"column\": \"Profit Ratio\", \"is_measure\": true},\n"
+            "    {\"role\": \"Tooltips\", \"table\": \"TableName\", \"column\": \"Profit\", \"is_measure\": false, \"agg_function\": 0}\n"
+            "  ]\n"
+            "}, ...}\n"
+            "Return ONLY the JSON object. No backticks or markdown."
+        )
+
+        # Try up to 3 times
+        for attempt in range(3):
+            raw = _call_claude(prompt, timeout=180, model=model)
+            if not raw:
+                if attempt < 2:
+                    print(f"       [VIS] Retry {attempt+2}/3...")
+                continue
+
+            # Clean response — strip markdown fences if present
+            cleaned = raw.strip()
+            if cleaned.startswith("```"):
+                cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
+                cleaned = re.sub(r"\s*```$", "", cleaned)
+
+            try:
+                parsed = json.loads(cleaned)
+                if isinstance(parsed, dict):
+                    # Convert Claude's field assignments into full singleVisual defs
+                    for ws_name, vis_spec in parsed.items():
+                        sv = _build_single_visual_from_spec(vis_spec, model_schema)
+                        if sv:
+                            results[ws_name] = sv
+                    print(f"       [VIS] Parsed {len(parsed)} visual definitions")
+                    break
+            except json.JSONDecodeError as e:
+                print(f"       [VIS] JSON parse error: {e}")
+                if attempt < 2:
+                    print(f"       [VIS] Retry {attempt+2}/3...")
+
+    return results
+
+
+def _build_single_visual_from_spec(vis_spec, model_schema):
+    """Build a complete singleVisual dict from Claude's field assignment spec.
+
+    This is DETERMINISTIC — Claude decides WHAT fields go WHERE,
+    this function builds the exact PBI JSON structure.
+    """
+    visual_type = vis_spec.get("visualType", "clusteredBarChart")
+    title = vis_spec.get("title", "")
+    fields = vis_spec.get("fields", [])
+
+    if not fields:
+        return None
+
+    # Collect unique tables for From clause
+    table_aliases = {}  # table_name → alias letter
+    alias_counter = 0
+    for f in fields:
+        tbl = f.get("table", "")
+        if tbl and tbl not in table_aliases:
+            table_aliases[tbl] = chr(ord("s") + alias_counter)
+            alias_counter += 1
+
+    # Build From
+    from_clause = []
+    for tbl, alias in table_aliases.items():
+        from_clause.append({"Name": alias, "Entity": tbl, "Type": 0})
+
+    # Build Select and Projections
+    select_entries = []
+    projections = {}  # role → [queryRef, ...]
+    seen_names = set()
+
+    for f in fields:
+        tbl = f.get("table", "")
+        col = f.get("column", "")
+        role = f.get("role", "")
+        is_measure = f.get("is_measure", False)
+        agg_func = f.get("agg_function")
+
+        if not tbl or not col or not role:
+            continue
+
+        alias = table_aliases.get(tbl, "s")
+
+        # Validate column exists in model
+        tbl_schema = model_schema.get(tbl, {})
+        valid_cols = tbl_schema.get("columns", [])
+        valid_measures = tbl_schema.get("measures", [])
+
+        # Auto-detect measure if in measures list
+        if col in valid_measures:
+            is_measure = True
+        elif col not in valid_cols and col not in valid_measures:
+            # Column not found — skip
+            continue
+
+        # Build Select entry
+        select_entry = _build_prototype_query_select(
+            tbl, col, None, agg_func, is_measure, alias
+        )
+
+        query_name = select_entry["Name"]
+
+        # Dedup
+        if query_name in seen_names:
+            # Already added — just add to projections
+            if role not in projections:
+                projections[role] = []
+            projections[role].append({"queryRef": query_name, "active": True})
+            continue
+
+        seen_names.add(query_name)
+        select_entries.append(select_entry)
+
+        if role not in projections:
+            projections[role] = []
+        projections[role].append({"queryRef": query_name, "active": True})
+
+    if not select_entries:
+        return None
+
+    # Build prototypeQuery
+    proto_query = {
+        "Version": 2,
+        "From": from_clause,
+        "Select": select_entries,
+    }
+
+    # Build vcObjects
+    vc_objects = {}
+    if title:
+        vc_objects["title"] = [{"properties": {
+            "text": {"expr": {"Literal": {"Value": f"'{title}'"}}}
+        }}]
+
+    return {
+        "visualType": visual_type,
+        "projections": projections,
+        "prototypeQuery": proto_query,
+        "vcObjects": vc_objects,
+    }
+
+
+def convert_dashboard_to_page(db_context, visual_map, model_schema, model="haiku"):
+    """Send dashboard context to Claude and get PBI page with visualContainers.
+
+    Returns: page dict with visualContainers
+    """
+    # Build a compact visual summary for Claude (just type + title, not full query)
+    visual_summary = {}
+    for ws_name, vis in visual_map.items():
+        visual_summary[ws_name] = {
+            "visualType": vis.get("visualType", "clusteredBarChart"),
+            "has_projections": bool(vis.get("projections")),
+        }
+
+    prompt = (
+        "SYSTEM INSTRUCTIONS:\n"
+        "You are converting a Tableau dashboard layout to a Power BI report page.\n\n"
+        "RULES:\n"
+        "1. Return ONLY valid JSON — no markdown, no backticks.\n"
+        "2. PBI page canvas is 1280x720 pixels.\n"
+        f"3. Tableau dashboard is {db_context['width']}x{db_context['height']} pixels "
+        "with coordinates in 0-100000 range.\n"
+        "4. Convert zone coordinates: pbi_x = zone_x / 100000 * 1280, "
+        "pbi_y = zone_y / 100000 * 720 (similar for w, h).\n"
+        "5. For 'sheet' zones: place the worksheet visual.\n"
+        "6. For 'filter' zones: create a slicer visual.\n"
+        "7. For 'paramctrl' zones: create a slicer visual.\n"
+        "8. For 'text' zones: create a textbox visual.\n"
+        "9. For 'image' zones: create an image visual.\n"
+        "10. Skip hidden zones (hidden=true) and legend/title zones.\n"
+        "11. Each visualContainer needs: x, y, z, width, height, and a config string.\n"
+        "12. The config string should contain: name (16-char hex), layouts, singleVisual.\n"
+        "13. For sheet zones, use the visual definition from the visual map.\n"
+        "14. Ensure visuals don't overflow page bounds (clamp to 1280x720).\n\n"
+        "DASHBOARD CONTEXT:\n" + json.dumps(db_context, indent=1) + "\n\n"
+        "AVAILABLE VISUALS (worksheet → type):\n" + json.dumps(visual_summary, indent=1) + "\n\n"
+        "MODEL SCHEMA:\n" + json.dumps(model_schema, indent=1) + "\n\n"
+        "Return a JSON array of visualContainer objects for this page.\n"
+        "Each container: {\"x\": N, \"y\": N, \"z\": 0, \"width\": N, \"height\": N, "
+        "\"worksheet\": \"name\" (for sheet zones), \"zone_type\": \"sheet|filter|text|image\", "
+        "\"filter_column\": \"col\" (for filter zones), \"filter_table\": \"table\" (for filter zones), "
+        "\"text_content\": \"...\" (for text zones), \"image_path\": \"...\" (for image zones)}\n"
+        "Return ONLY the JSON array."
+    )
+
+    for attempt in range(3):
+        raw = _call_claude(prompt, timeout=120, model=model)
+        if not raw:
+            if attempt < 2:
+                continue
+            return []
+
+        cleaned = raw.strip()
+        if cleaned.startswith("```"):
+            cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
+            cleaned = re.sub(r"\s*```$", "", cleaned)
+
+        try:
+            parsed = json.loads(cleaned)
+            if isinstance(parsed, list):
+                print(f"       [VIS] Dashboard '{db_context['name']}': {len(parsed)} containers")
+                return parsed
+        except json.JSONDecodeError:
+            if attempt < 2:
+                print(f"       [VIS] Retry dashboard parse {attempt+2}/3...")
+
+    return []
+
+
+# ─────────────────────────────────────────────────────────
+# Phase 3: Deterministic Assembly
+# ─────────────────────────────────────────────────────────
+
+def _gen_visual_id():
+    """Generate a 16-char hex visual ID."""
+    return uuid.uuid4().hex[:16]
+
+
+def _build_prototype_query_select(table, column, aggregation, agg_function,
+                                  is_measure, source_alias):
+    """Build a single Select entry for prototypeQuery."""
+    if is_measure:
+        # Named measure reference
+        return {
+            "Measure": {
+                "Expression": {"SourceRef": {"Source": source_alias}},
+                "Property": column,
+            },
+            "Name": f"{table}.{column}",
+        }
+    elif agg_function is not None:
+        # Aggregated column
+        agg_names = {0: "Sum", 1: "Average", 2: "Count", 3: "Min", 4: "Max", 5: "CountD"}
+        agg_label = agg_names.get(agg_function, "Sum")
+        return {
+            "Aggregation": {
+                "Expression": {
+                    "Column": {
+                        "Expression": {"SourceRef": {"Source": source_alias}},
+                        "Property": column,
+                    }
+                },
+                "Function": agg_function,
+            },
+            "Name": f"{agg_label}({table}.{column})",
+        }
+    else:
+        # Plain column (dimension)
+        return {
+            "Column": {
+                "Expression": {"SourceRef": {"Source": source_alias}},
+                "Property": column,
+            },
+            "Name": f"{table}.{column}",
+        }
+
+
+def _build_visual_container(visual_def, x, y, width, height, z=0):
+    """Build a complete visualContainer dict from a singleVisual definition."""
+    # Clamp to page bounds
+    x = max(0, min(x, PBI_PAGE_WIDTH - 50))
+    y = max(0, min(y, PBI_PAGE_HEIGHT - 50))
+    width = max(50, min(width, PBI_PAGE_WIDTH - x))
+    height = max(50, min(height, PBI_PAGE_HEIGHT - y))
+
+    vid = _gen_visual_id()
+
+    config = {
+        "name": vid,
+        "layouts": [{
+            "id": 0,
+            "position": {
+                "x": x, "y": y, "z": z,
+                "width": width, "height": height,
+                "tabOrder": z,
+            }
+        }],
+        "singleVisual": visual_def,
+    }
+
+    return {
+        "x": float(x),
+        "y": float(y),
+        "z": z,
+        "width": float(width),
+        "height": float(height),
+        "config": json.dumps(config, ensure_ascii=False),
+        "filters": "[]",
+        "tabOrder": z,
+    }
+
+
+def _build_slicer_visual(table, column, source_alias="s"):
+    """Build a slicer (filter) visual definition."""
+    qref = f"{table}.{column}"
+    return {
+        "visualType": "slicer",
+        "projections": {
+            "Values": [{"queryRef": qref, "active": True}],
+        },
+        "prototypeQuery": {
+            "Version": 2,
+            "From": [{"Name": source_alias, "Entity": table, "Type": 0}],
+            "Select": [{
+                "Column": {
+                    "Expression": {"SourceRef": {"Source": source_alias}},
+                    "Property": column,
+                },
+                "Name": qref,
+            }],
+        },
+        "vcObjects": {
+            "title": [{"properties": {
+                "text": {"expr": {"Literal": {"Value": f"'{column}'"}}}
+            }}],
+        },
+    }
+
+
+def _build_textbox_visual(text_content):
+    """Build a textbox visual definition."""
+    return {
+        "visualType": "textbox",
+        "objects": {
+            "general": [{"properties": {
+                "paragraphs": [{"textRuns": [{"value": text_content}]}]
+            }}],
+        },
+    }
+
+
+def _build_image_visual(image_path):
+    """Build an image visual definition."""
+    return {
+        "visualType": "image",
+        "objects": {
+            "general": [{"properties": {
+                "imageUrl": {"expr": {"Literal": {"Value": f"'{image_path}'"}}}
+            }}],
+        },
+    }
+
+
+def assemble_page(db_name, containers, visual_map, model_schema, ordinal=0):
+    """Assemble a PBI page from Claude's container layout + visual definitions.
+
+    Merges the positional data from dashboard conversion with the full visual
+    definitions from worksheet conversion.
+    """
+    page_name = re.sub(r"[^A-Za-z0-9_]", "_", db_name)
+    visual_containers = []
+
+    for ci, container in enumerate(containers):
+        x = container.get("x", 0)
+        y = container.get("y", 0)
+        w = container.get("width", 200)
+        h = container.get("height", 200)
+        z = container.get("z", ci)
+        zone_type = container.get("zone_type", "sheet")
+
+        if container.get("hidden"):
+            continue
+
+        if zone_type == "sheet":
+            ws_name = container.get("worksheet", "")
+            vis_def = visual_map.get(ws_name)
+            if not vis_def:
+                continue
+            vc = _build_visual_container(vis_def, x, y, w, h, z)
+            visual_containers.append(vc)
+
+        elif zone_type == "filter":
+            ftable = container.get("filter_table", "")
+            fcol = container.get("filter_column", "")
+            if ftable and fcol:
+                vis_def = _build_slicer_visual(ftable, fcol)
+                vc = _build_visual_container(vis_def, x, y, w, h, z)
+                visual_containers.append(vc)
+
+        elif zone_type == "text":
+            text = container.get("text_content", "")
+            if text:
+                vis_def = _build_textbox_visual(text)
+                vc = _build_visual_container(vis_def, x, y, w, h, z)
+                visual_containers.append(vc)
+
+        elif zone_type == "image":
+            img = container.get("image_path", "")
+            if img:
+                vis_def = _build_image_visual(img)
+                vc = _build_visual_container(vis_def, x, y, w, h, z)
+                visual_containers.append(vc)
+
+    return {
+        "name": f"ReportSection_{page_name}",
+        "displayName": db_name,
+        "config": "{}",
+        "displayOption": 0,
+        "height": float(PBI_PAGE_HEIGHT),
+        "width": float(PBI_PAGE_WIDTH),
+        "filters": "[]",
+        "ordinal": ordinal,
+        "visualContainers": visual_containers,
+    }
+
+
+# ─────────────────────────────────────────────────────────
+# Phase 4: Main Entry Point
+# ─────────────────────────────────────────────────────────
+
+def migrate_visuals(twb_root, metadata, bim_path=None, model="haiku"):
+    """Main entry point — converts Tableau visuals to PBI report pages.
+
+    Args:
+        twb_root: XML root element of the TWB file
+        metadata: metadata dict from build_metadata()
+        bim_path: path to model.bim (for accurate schema)
+        model: Claude model to use (default: haiku)
+
+    Returns:
+        list of page dicts for report.json sections
+    """
+    print(f"       [VIS] Starting visual migration...")
+
+    # Build lookup maps
+    ds_caption_map = {}
+    for ds in twb_root.findall("./datasources/datasource"):
+        name = ds.attrib.get("name", "")
+        caption = ds.attrib.get("caption", "") or name
+        if name and caption:
+            ds_caption_map[name] = caption
+
+    field_name_map = {}
+    for ds in twb_root.findall("./datasources/datasource"):
+        for col in ds.findall("column"):
+            raw = col.attrib.get("name", "").replace("[", "").replace("]", "")
+            cap = col.attrib.get("caption", "")
+            if raw and cap and raw != cap:
+                field_name_map[raw] = cap
+
+    # Step 1: Extract model schema
+    model_schema = extract_model_schema(metadata, bim_path)
+    print(f"       [VIS] Model: {len(model_schema)} tables, "
+          f"{sum(len(v['columns']) for v in model_schema.values())} columns, "
+          f"{sum(len(v['measures']) for v in model_schema.values())} measures")
+
+    # Step 2: Extract worksheet contexts
+    ws_contexts = []
+    ws_names = set()
+    for ws in twb_root.findall(".//worksheet"):
+        ctx = extract_worksheet_context(ws, ds_caption_map, field_name_map)
+        if ctx["name"] and ctx["datasource"]:
+            ws_contexts.append(ctx)
+            ws_names.add(ctx["name"])
+    print(f"       [VIS] Extracted {len(ws_contexts)} worksheet contexts")
+
+    # Step 3: Convert worksheets to PBI visuals via Claude
+    visual_map = convert_worksheets_to_visuals(ws_contexts, model_schema, model=model)
+    print(f"       [VIS] Converted {len(visual_map)}/{len(ws_contexts)} worksheets to visuals")
+
+    # Step 4: Extract dashboard contexts
+    db_contexts = []
+    for db in twb_root.findall(".//dashboard"):
+        db_ctx = extract_dashboard_context(db, ds_caption_map)
+        if db_ctx["zones"]:
+            db_contexts.append(db_ctx)
+    print(f"       [VIS] Found {len(db_contexts)} dashboards")
+
+    # Step 5: Convert dashboards to PBI pages via Claude
+    pages = []
+    if db_contexts:
+        for di, db_ctx in enumerate(db_contexts):
+            containers = convert_dashboard_to_page(
+                db_ctx, visual_map, model_schema, model=model
+            )
+            if containers:
+                page = assemble_page(
+                    db_ctx["name"], containers, visual_map, model_schema, ordinal=di
+                )
+                pages.append(page)
+    else:
+        # No dashboards — create one page per worksheet
+        for wi, ctx in enumerate(ws_contexts):
+            ws_name = ctx["name"]
+            vis_def = visual_map.get(ws_name)
+            if not vis_def:
+                continue
+            vc = _build_visual_container(vis_def, 10, 10, 1260, 700, 0)
+            pages.append({
+                "name": f"ReportSection_{re.sub(r'[^A-Za-z0-9_]', '_', ws_name)}",
+                "displayName": ws_name,
+                "config": "{}",
+                "displayOption": 0,
+                "height": float(PBI_PAGE_HEIGHT),
+                "width": float(PBI_PAGE_WIDTH),
+                "filters": "[]",
+                "ordinal": wi,
+                "visualContainers": [vc],
+            })
+
+    total_visuals = sum(len(p.get("visualContainers", [])) for p in pages)
+    print(f"       [VIS] Generated {len(pages)} pages with {total_visuals} visuals")
+
+    return pages

@@ -316,8 +316,7 @@ def main():
     Status.step(6, TOTAL_STEPS, "Deploying to Power BI Desktop...")
 
     deployed, deploy_port = _deploy_via_pbip(bim_path, output_dir, workbook_name, data_dir, metadata,
-                                               resolved_relationships=resolved_relationships,
-                                               twb_path=twb_path)
+                                               resolved_relationships=resolved_relationships)
 
     # =========================================================
     # STEP 7: Summary
@@ -726,27 +725,12 @@ def _create_pbip_project(bim_path, output_dir, workbook_name, report_pages=None)
     return os.path.abspath(pbir_path)
 
 
-def _deploy_via_pbip(bim_path, output_dir, workbook_name, data_dir, metadata=None,
-                     resolved_relationships=None, twb_path=None):
+def _deploy_via_pbip(bim_path, output_dir, workbook_name, data_dir, metadata=None, resolved_relationships=None):
     """Deploy via PBIP project: create project with visuals, open in PBI."""
 
     # --- Generate report pages from dashboards ---
-    # Use AI-driven visual_migrator if TWB path available, else fallback to pbir_generator
-    report_pages = []
-    if twb_path:
-        try:
-            from parser.visual_migrator import migrate_visuals
-            from parser.xml_parser import load_xml
-            twb_root = load_xml(twb_path)
-            report_pages = migrate_visuals(twb_root, metadata, bim_path)
-        except Exception as e:
-            Status.warn(f"Visual migrator failed: {e} — falling back to basic generator")
-            report_pages = []
-
-    if not report_pages:
-        from parser.pbir_generator import generate_report_pages
-        report_pages = generate_report_pages(metadata) if metadata else []
-
+    from parser.pbir_generator import generate_report_pages
+    report_pages = generate_report_pages(metadata) if metadata else []
     num_visuals = sum(len(p.get("visualContainers", [])) for p in report_pages)
     Status.info(f"Generated {len(report_pages)} pages with {num_visuals} visuals")
 

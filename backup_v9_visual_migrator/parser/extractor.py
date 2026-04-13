@@ -1,21 +1,3 @@
-"""TWBX (Tableau packaged workbook) extraction utilities.
-
-A ``.twbx`` file is a ZIP archive containing:
-- Exactly one ``.twb`` XML file (the workbook definition).
-- Zero or more ``.hyper`` files (Tableau's columnar data extract format).
-- Optional image assets (logos, custom shapes) used by dashboards.
-
-This module exposes:
-- ``extract_twb`` - pull the ``.twb`` XML out of a ``.twbx`` (or pass
-  through if the caller already handed us a raw ``.twb``).
-- ``extract_images`` - pull image assets into an output folder so the
-  visual / report generator can reference them.
-
-Hyper -> CSV extraction itself is handled in ``migrate.py`` because it
-requires ``tableauhyperapi`` and has workbook-specific fallback logic
-for TEMP-named and non-Hyper datasources.
-"""
-
 import zipfile
 import os
 

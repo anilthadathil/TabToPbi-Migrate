@@ -1,36 +1,3 @@
-"""Tableau TWB XML parser.
-
-Extracts the complete semantic model from a Tableau workbook XML file
-(``.twb``) into plain Python data structures (lists / dicts) so that
-downstream generators can produce Power BI artefacts.
-
-Handles both:
-- Legacy single-datasource / single-table workbooks.
-- Tableau 2020.2+ object-graph workbooks where a single datasource can
-  expose multiple tables joined via ``<relation>``, ``<relationships>``,
-  and ``<object-graph>`` elements.
-
-Categories extracted (each one via a ``get_*`` function):
-- Datasources: names, captions, connections, per-datasource table lists.
-- Columns: both physical (from ``<metadata-record>``) and calculated
-  (from ``<column>``).
-- Calculations: Tableau formulas (trivial / parameter-only filtered out).
-- Joins: SQL-style joins inside a datasource.
-- Relationships: cross-datasource blending relationships.
-- Worksheets: chart type, axes, filters, encodings, shelf refs.
-- Dashboards: layout of worksheets on pages.
-- Parameters: Tableau parameters w/ allowable values + data type.
-- Display folders: field organisation hierarchy.
-- Actions: filter / navigation actions between worksheets.
-- Dual axis, table calculations, LOD expressions: specialised helpers.
-- Field name map: internal id -> caption lookup needed everywhere else
-  because Tableau often references fields by opaque internal names like
-  ``[Calculation_1234567890]``.
-
-Everything here is pure Python / ``xml.etree`` - no side effects, no
-network, no I/O beyond ``load_xml``.
-"""
-
 import xml.etree.ElementTree as ET
 import re
 

@@ -1,0 +1,30 @@
+def build_metadata(
+    datasources,
+    columns,
+    calculations,
+    joins,
+    relationships,
+    worksheets,
+    parameters,
+    actions,
+    dual_axis,
+    table_calcs,
+    lods,
+    display_folders=None,
+    field_name_map=None
+):
+    return {
+        "datasources": datasources,
+        "columns": columns,
+        "calculations": calculations,
+        "joins": joins,
+        "relationships": relationships,
+        "worksheets": worksheets,
+        "parameters": parameters,
+        "actions": actions,
+        "dual_axis": dual_axis,
+        "table_calculations": table_calcs,
+        "lod_expressions": lods,
+        "display_folders": display_folders or {},
+        "field_name_map": field_name_map or {}
+    }

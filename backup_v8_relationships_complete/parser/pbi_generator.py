@@ -1,24 +1,3 @@
-"""Tabular Editor 2 (TE2) C# script generator - fallback deployment path.
-
-The primary deployment path is PBIP (``bim_generator`` -> ``model.bim`` ->
-open in PBI Desktop). This module is the fallback: it emits C# scripts
-that TE2 can execute against an existing ``.pbix`` / ``.bim`` to create
-tables, calculated columns, measures, relationships and display folders.
-
-Scripts emitted:
-- ``generate_tabular_editor_script`` - full model build (tables + M
-  partitions + columns + measures + Parameters table).
-- ``generate_measures_only_script`` - just measures and calculated
-  columns; assumes the user already loaded CSV / Hyper data manually.
-- ``generate_relationship_script`` - relationships only.
-- ``generate_display_folder_script`` - field folder assignments only.
-
-Useful when:
-- PBIP deployment fails (corrupt model.bim, unsupported construct).
-- The user wants to incrementally apply parts of the migration to an
-  existing report they have already polished.
-"""
-
 import os
 import re
 from parser.dax_converter import convert_tableau_to_dax

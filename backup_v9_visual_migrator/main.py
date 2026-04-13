@@ -1,13 +1,3 @@
-"""Sample / reference pipeline driver for Tableau to Power BI migration.
-
-This is a simplified, linear driver that demonstrates the core parsing flow
-(extract -> parse -> build metadata -> emit scripts) without the full
-orchestration, validation loops, and PBIP deployment that ``migrate.py`` does.
-
-Useful as a reference implementation for understanding the library, or as a
-starting point for custom pipelines. For production use, prefer ``migrate.py``.
-"""
-
 from parser.xml_parser import (
     load_xml,
     get_datasources,

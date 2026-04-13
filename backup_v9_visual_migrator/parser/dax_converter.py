@@ -1,36 +1,3 @@
-"""Tableau formula -> DAX conversion engine.
-
-This is the heart of the semantic migration. It turns Tableau's mixed
-SQL-like / functional calc syntax into syntactically valid DAX.
-
-Three conversion paths, in order of preference:
-
-1. ``convert_tableau_to_dax`` - pure-Python regex / AST-style rewriter.
-   Fast, deterministic, free. Handles the large majority of real-world
-   formulas directly: IF/ELSEIF/CASE, LOD ({FIXED}, {INCLUDE},
-   {EXCLUDE}), function renames (AVG->AVERAGE, COUNTD->DISTINCTCOUNT,
-   ATTR->SELECTEDVALUE, IFNULL->COALESCE, ...), NULL->BLANK, field
-   qualification, cross-datasource references.
-
-2. ``convert_smart`` - runs (1), catches obvious failure signals, and
-   falls back to Claude CLI for the tricky ones (nested LODs,
-   WINDOW_* table calcs, unusual constructs).
-
-3. ``convert_with_claude_batch`` - sends many formulas in one Claude
-   call (chunked, default ~30 per batch). Used by ``bim_generator``
-   when the cache misses en masse. Batched because individual CLI
-   calls dominate runtime otherwise.
-
-A ``DaxCache`` (``dax_cache.py``) sits in front of all three so
-pattern-equivalent formulas are converted at most once across the
-entire lifetime of the tool.
-
-Design note: the pipeline deliberately resolves internal Tableau field
-names (``Calculation_1234567890`` style) via the ``field_name_map``
-before any other pass; everything downstream can assume human-readable
-names.
-"""
-
 import re
 
 

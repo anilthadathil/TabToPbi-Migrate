@@ -1,0 +1,8 @@
+- [DAX conversion pipeline lessons](feedback_dax_conversion.md) — DAX rules, 3-layer validation, batch retry, TEMP Hyper naming, parameter collisions
+- [Pipeline architecture](project_pipeline_architecture.md) — File locations, pipeline flow, backups, tested workbooks
+- [User profile](user_anil.md) — Senior dev at USEReady, wants generic solutions for 5000+ workbooks, prefers deep investigation
+- [Model benchmarks](reference_model_benchmarks.md) — Haiku vs Sonnet vs Opus speed/quality for DAX conversion, chunk size 30 optimal
+- [Relationship implementation](project_relationship_implementation.md) — Bridge table for composite keys, cache normalization, structural DAX fixes, all 5 scenarios
+- [No hardcoded fixes](feedback_no_hardcoded_fixes.md) — Never use regex post-processing, all fixes must go through AI pipeline
+- [PBI model.bim rules](feedback_pbi_model_rules.md) — compat level 1600, 1:1 bothDirections, no ambiguous paths, dedup per pair, test both workbooks
+- [Testing workflow](feedback_testing_workflow.md) — Test one workbook at a time, wait for user confirmation before next
