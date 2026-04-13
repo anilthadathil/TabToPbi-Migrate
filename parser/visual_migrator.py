@@ -20,6 +20,21 @@ import os
 import time
 import xml.etree.ElementTree as ET
 
+from parser.visual_cache import VisualCache
+
+
+# Sideband channel for migrate.py's migration report generator — populated at
+# the end of ``migrate_visuals``. Empty if visual migration was never run.
+_LAST_MIGRATION_DETAILS = {}
+
+
+def get_last_migration_details():
+    """Return a shallow copy of the details from the most recent
+    ``migrate_visuals`` call: ``{visual_map, ws_contexts, db_contexts, pages}``.
+    Empty dict if ``migrate_visuals`` has not been called in this process.
+    """
+    return dict(_LAST_MIGRATION_DETAILS)
+
 
 # ─────────────────────────────────────────────────────────
 # Constants
@@ -592,13 +607,53 @@ PBI ROLES by visual type:
 - matrix: Rows (row dims), Columns (col dims), Values (measures)"""
 
 
-def convert_worksheets_to_visuals(ws_contexts, model_schema, model="haiku"):
+def _parse_visual_response(raw, model_schema, results):
+    """Parse a Claude visual-batch response into the results dict.
+
+    Shared between cache-hit and fresh-call paths so they cannot diverge.
+    Returns the count of visuals parsed, or None on JSON failure.
+    """
+    cleaned = raw.strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
+        cleaned = re.sub(r"\s*```$", "", cleaned)
+    try:
+        parsed = json.loads(cleaned)
+    except json.JSONDecodeError as e:
+        print(f"       [VIS] JSON parse error: {e}")
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    for ws_name, vis_spec in parsed.items():
+        sv = _build_single_visual_from_spec(vis_spec, model_schema)
+        if sv:
+            results[ws_name] = sv
+    return len(parsed)
+
+
+def convert_worksheets_to_visuals(ws_contexts, model_schema, model="haiku",
+                                  cache=None):
     """Send worksheet contexts to Claude in batches and get PBI visual definitions.
 
-    Returns: {worksheet_name: singleVisual_dict}
+    Each batch prompt is looked up in the visual cache first — cache hits
+    skip the Claude CLI call entirely. On a miss, the prompt is sent to
+    Claude and the (successfully-parsed) response is stored in the cache
+    so subsequent runs of the same workbook are free.
+
+    Args:
+        ws_contexts: list of worksheet context dicts from ``extract_worksheet_context``.
+        model_schema: dict describing the PBI model (tables, cols, measures).
+        model: Claude model name ("haiku", "sonnet", ...).
+        cache: optional ``VisualCache`` instance. If ``None``, one is
+               constructed pointing at the default ``~/.claude/visual_cache.db``.
+
+    Returns: ``{worksheet_name: singleVisual_dict}``.
     """
     if not ws_contexts:
         return {}
+
+    if cache is None:
+        cache = VisualCache()
 
     results = {}
     # Batch into chunks of 8 worksheets
@@ -628,35 +683,36 @@ def convert_worksheets_to_visuals(ws_contexts, model_schema, model="haiku"):
             "Return ONLY the JSON object. No backticks or markdown."
         )
 
-        # Try up to 3 times
+        # 1. Try the cache first.
+        cached = cache.get(prompt)
+        if cached:
+            count = _parse_visual_response(cached, model_schema, results)
+            if count is not None:
+                print(f"       [VIS] Cache HIT — parsed {count} visual definitions (skipped Claude)")
+                continue
+            # Cached blob somehow doesn't parse — fall through to a fresh call.
+            print(f"       [VIS] Cache entry unparseable — re-calling Claude")
+
+        # 2. Fresh Claude call. Up to 3 attempts.
         for attempt in range(3):
             raw = _call_claude(prompt, timeout=180, model=model)
             if not raw:
                 if attempt < 2:
                     print(f"       [VIS] Retry {attempt+2}/3...")
                 continue
+            count = _parse_visual_response(raw, model_schema, results)
+            if count is not None:
+                print(f"       [VIS] Parsed {count} visual definitions")
+                cache.put(prompt, raw, tag="worksheet_batch")
+                break
+            if attempt < 2:
+                print(f"       [VIS] Retry {attempt+2}/3...")
 
-            # Clean response — strip markdown fences if present
-            cleaned = raw.strip()
-            if cleaned.startswith("```"):
-                cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
-                cleaned = re.sub(r"\s*```$", "", cleaned)
-
-            try:
-                parsed = json.loads(cleaned)
-                if isinstance(parsed, dict):
-                    # Convert Claude's field assignments into full singleVisual defs
-                    for ws_name, vis_spec in parsed.items():
-                        sv = _build_single_visual_from_spec(vis_spec, model_schema)
-                        if sv:
-                            results[ws_name] = sv
-                    print(f"       [VIS] Parsed {len(parsed)} visual definitions")
-                    break
-            except json.JSONDecodeError as e:
-                print(f"       [VIS] JSON parse error: {e}")
-                if attempt < 2:
-                    print(f"       [VIS] Retry {attempt+2}/3...")
-
+    s = cache.stats()
+    print(
+        f"       [VIS] Visual cache: {s['hits']} hits, {s['misses']} misses, "
+        f"{s['hit_rate']}% hit rate ({s['entries']} entries in store)"
+    )
     return results
 
 
@@ -1211,5 +1267,16 @@ def migrate_visuals(twb_root, metadata, bim_path=None, model="haiku"):
 
     total_visuals = sum(len(p.get("visualContainers", [])) for p in pages)
     print(f"       [VIS] Generated {len(pages)} pages with {total_visuals} visuals")
+
+    # Stash migration details on the module so migrate.py's report generator
+    # can pick them up without us changing the public return type. This is a
+    # pragmatic sideband — the pipeline is always run single-workbook in-process.
+    _LAST_MIGRATION_DETAILS.clear()
+    _LAST_MIGRATION_DETAILS.update({
+        "visual_map": visual_map,
+        "ws_contexts": ws_contexts,
+        "db_contexts": db_contexts,
+        "pages": pages,
+    })
 
     return pages

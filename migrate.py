@@ -320,16 +320,42 @@ def main():
                                                twb_path=twb_path)
 
     # =========================================================
-    # STEP 7: Summary
+    # STEP 7: Summary + migration report
     # =========================================================
     Status.step(7, TOTAL_STEPS, "Migration summary")
 
+    # Generate the migration report: maps every Tableau datasource /
+    # worksheet / dashboard / calculation to what it became in Power BI.
+    report_path = None
+    try:
+        from parser.migration_report import generate_migration_report
+        from parser.visual_migrator import get_last_migration_details
+        details = get_last_migration_details()
+        with open(bim_path, "r", encoding="utf-8") as _f:
+            _bim = json.load(_f)
+        report_path = generate_migration_report(
+            output_dir=output_dir,
+            workbook_name=workbook_name,
+            input_path=input_path,
+            metadata=metadata,
+            bim=_bim,
+            visual_map=details.get("visual_map"),
+            pages=details.get("pages"),
+            ws_contexts=details.get("ws_contexts"),
+            db_contexts=details.get("db_contexts"),
+            csv_dir=data_dir,
+        )
+        Status.success(f"Migration report: {os.path.abspath(report_path)}")
+    except Exception as _e:
+        Status.warn(f"Could not generate migration report: {_e}")
+
+    report_line = ("\n      Report:   " + os.path.abspath(report_path)) if report_path else ""
     print(f"""
     {Status.BOLD}Output Files:{Status.END}
       Model:    {os.path.abspath(bim_path)}
       Data:     {os.path.abspath(data_dir)}/
       Scripts:  {os.path.abspath(scripts_dir)}/
-      Metadata: {os.path.abspath(meta_path)}
+      Metadata: {os.path.abspath(meta_path)}{report_line}
     """)
 
     pbix_path = os.path.join(os.path.abspath(output_dir), f"{workbook_name}.pbix")
