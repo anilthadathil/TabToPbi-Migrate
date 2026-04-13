@@ -1078,20 +1078,39 @@ def generate_bim(metadata, csv_dir, pg_config=None):
                 col_def["displayFolder"] = folder
             tom_columns.append(col_def)
 
-        # Auto-generate month-level date columns for any date/datetime column
-        # This enables proper monthly aggregation in area/line charts
+        # Auto-generate date-part derivative columns for every date/datetime
+        # column. Tableau shelves can reference a date at a specific
+        # granularity (yr: / qr: / mn: / tmn: / twk: / tyr:) but PBI's
+        # prototypeQuery can only point at a column — there's no per-
+        # reference "show this as Year" knob. So we pre-materialise one
+        # calc column per date part and the visual migrator references
+        # them by name (e.g. "Order Date (Year)") when the Tableau shelf
+        # had a yr: prefix.
+        #
+        # All date-part columns are hidden — they don't clutter the field
+        # pane in PBI Desktop, but remain available for prototypeQuery
+        # binding and for ad-hoc DAX usage.
         for c in cols:
-            if c["datatype"] in ("date", "datetime"):
-                month_col_name = f"{c['name']} (Month)"
-                calc_columns_auto = {
-                    "name": month_col_name,
-                    "dataType": "dateTime",
+            if c["datatype"] not in ("date", "datetime"):
+                continue
+            base = c["name"]
+            date_part_cols = [
+                # (suffix, DAX expression, PBI dataType)
+                ("Year",    f"YEAR('{table_name}'[{base}])",               "int64"),
+                ("Quarter", f"QUARTER('{table_name}'[{base}])",            "int64"),
+                ("Month",   f"EOMONTH('{table_name}'[{base}], 0)",         "dateTime"),
+                ("Week",    f"WEEKNUM('{table_name}'[{base}])",            "int64"),
+                ("Day",     f"DAY('{table_name}'[{base}])",                "int64"),
+            ]
+            for suffix, expr, dtype in date_part_cols:
+                tom_columns.append({
+                    "name": f"{base} ({suffix})",
+                    "dataType": dtype,
                     "type": "calculated",
-                    "expression": f"EOMONTH('{table_name}'[{c['name']}], 0)",
+                    "expression": expr,
                     "isDataTypeInferred": True,
                     "isHidden": True,
-                }
-                tom_columns.append(calc_columns_auto)
+                })
 
         # Collect all other table names for cross-table detection
         other_tables = {tn for tn in tables_set if tn != table_name}

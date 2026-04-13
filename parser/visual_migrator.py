@@ -437,9 +437,13 @@ def extract_model_schema(metadata, bim_path=None):
             bim = json.load(f)
         for t in bim.get("model", {}).get("tables", []):
             tname = t["name"]
+            # Include both physical AND calculated columns. The calc
+            # columns carry the auto-generated date-part derivatives
+            # (``[Date] (Year)``, ``(Quarter)``, ``(Month)``, ``(Week)``,
+            # ``(Day)``) that visuals reference when a Tableau shelf had
+            # a yr: / qr: / mn: / tmn: / twk: prefix.
             schema[tname] = {
-                "columns": [c["name"] for c in t.get("columns", [])
-                           if c.get("type") != "calculated" or c.get("name") == "RelKey"],
+                "columns": [c["name"] for c in t.get("columns", [])],
                 "measures": [m["name"] for m in t.get("measures", [])],
             }
         return schema
@@ -604,14 +608,82 @@ PBI ROLES by visual type:
 - card: Fields (exactly 1 measure)
 - multiRowCard: Fields (2+ measures shown as KPI tiles)
 - tableEx: Values (mix of dimensions and measures as table columns)
-- matrix: Rows (row dims), Columns (col dims), Values (measures)"""
+- matrix: Rows (row dims), Columns (col dims), Values (measures)
+
+DATE-PART / TRUNCATION RULES (critical — wrong date granularity breaks axes):
+The worksheet context includes a per-field "derivation" token copied from
+Tableau's shelf pill. When the derivation is one of these, you MUST emit
+a "date_part" on the corresponding output field:
+
+  - yr  / tyr  → "date_part": "Year"
+  - qr         → "date_part": "Quarter"
+  - mn  / tmn  → "date_part": "Month"
+  - twk        → "date_part": "Week"
+
+If derivation is "none" / "sum" / "avg" / etc., omit date_part entirely.
+
+The pipeline auto-materialises calc columns named "<DateCol> (Year)",
+"(Quarter)", "(Month)", "(Week)", "(Day)" for every date/datetime
+column in the model. Do NOT invent these names yourself — just set the
+date_part token and the pipeline will substitute the column binding to
+the matching pre-computed calc column. This gives Power BI the SAME
+granularity on the axis as Tableau had (year axis = integer years,
+not full dates)."""
 
 
-def _parse_visual_response(raw, model_schema, results):
+# Tableau derivation token -> PBI date-part calc-column suffix.
+_DERIVATION_TO_DATE_PART = {
+    "yr": "Year", "tyr": "Year",
+    "qr": "Quarter",
+    "mn": "Month", "tmn": "Month",
+    "twk": "Week",
+}
+
+
+def _backfill_date_parts(vis_spec, ws_ctx):
+    """Deterministic fallback: when Claude's response omits ``date_part``
+    on a field but the original Tableau shelf carried a date-part
+    derivation, fill it in.
+
+    This keeps old cached responses (from before the prompt update) working
+    correctly — and defends against Claude occasionally forgetting the
+    field on new calls.
+    """
+    if not ws_ctx:
+        return
+    # Index every shelf field by (table, column) with its derivation.
+    lookup = {}
+    for shelf_key in ("rows_fields", "cols_fields", "color", "size",
+                      "shape", "detail", "label", "text", "tooltip"):
+        items = ws_ctx.get(shelf_key)
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            tbl = item.get("table")
+            col = item.get("column")
+            deriv = item.get("derivation")
+            if tbl and col and deriv:
+                lookup[(tbl, col)] = deriv
+
+    for f in vis_spec.get("fields", []) or []:
+        if f.get("date_part"):
+            continue  # Claude already provided it — trust it
+        tbl = f.get("table")
+        col = f.get("column")
+        deriv = lookup.get((tbl, col))
+        if deriv in _DERIVATION_TO_DATE_PART:
+            f["date_part"] = _DERIVATION_TO_DATE_PART[deriv]
+
+
+def _parse_visual_response(raw, model_schema, results, ctx_by_name=None):
     """Parse a Claude visual-batch response into the results dict.
 
     Shared between cache-hit and fresh-call paths so they cannot diverge.
-    Returns the count of visuals parsed, or None on JSON failure.
+    ``ctx_by_name`` — ``{worksheet_name: ws_context}`` — is consulted to
+    backfill the ``date_part`` field when Claude omits it. Returns the
+    count of visuals parsed, or None on JSON failure.
     """
     cleaned = raw.strip()
     if cleaned.startswith("```"):
@@ -625,6 +697,8 @@ def _parse_visual_response(raw, model_schema, results):
     if not isinstance(parsed, dict):
         return None
     for ws_name, vis_spec in parsed.items():
+        if ctx_by_name:
+            _backfill_date_parts(vis_spec, ctx_by_name.get(ws_name))
         sv = _build_single_visual_from_spec(vis_spec, model_schema)
         if sv:
             results[ws_name] = sv
@@ -656,6 +730,8 @@ def convert_worksheets_to_visuals(ws_contexts, model_schema, model="haiku",
         cache = VisualCache()
 
     results = {}
+    # ws_name -> full context, used to backfill omitted date_part hints.
+    ctx_by_name = {c.get("name"): c for c in ws_contexts if c.get("name")}
     # Batch into chunks of 8 worksheets
     chunk_size = 8
     chunks = [ws_contexts[i:i+chunk_size] for i in range(0, len(ws_contexts), chunk_size)]
@@ -674,19 +750,20 @@ def convert_worksheets_to_visuals(ws_contexts, model_schema, model="haiku",
             "  \"visualType\": \"clusteredBarChart\",\n"
             "  \"title\": \"Chart Title\",\n"
             "  \"fields\": [\n"
-            "    {\"role\": \"Category\", \"table\": \"TableName\", \"column\": \"ColName\", \"is_measure\": false},\n"
+            "    {\"role\": \"Category\", \"table\": \"TableName\", \"column\": \"Order Date\", \"is_measure\": false, \"date_part\": \"Year\"},\n"
             "    {\"role\": \"Y\", \"table\": \"TableName\", \"column\": \"Sales\", \"is_measure\": false, \"agg_function\": 0},\n"
             "    {\"role\": \"Y\", \"table\": \"TableName\", \"column\": \"Profit Ratio\", \"is_measure\": true},\n"
             "    {\"role\": \"Tooltips\", \"table\": \"TableName\", \"column\": \"Profit\", \"is_measure\": false, \"agg_function\": 0}\n"
             "  ]\n"
             "}, ...}\n"
+            "Emit date_part ONLY when the context's derivation is yr/tyr/qr/mn/tmn/twk.\n"
             "Return ONLY the JSON object. No backticks or markdown."
         )
 
         # 1. Try the cache first.
         cached = cache.get(prompt)
         if cached:
-            count = _parse_visual_response(cached, model_schema, results)
+            count = _parse_visual_response(cached, model_schema, results, ctx_by_name)
             if count is not None:
                 print(f"       [VIS] Cache HIT — parsed {count} visual definitions (skipped Claude)")
                 continue
@@ -700,7 +777,7 @@ def convert_worksheets_to_visuals(ws_contexts, model_schema, model="haiku",
                 if attempt < 2:
                     print(f"       [VIS] Retry {attempt+2}/3...")
                 continue
-            count = _parse_visual_response(raw, model_schema, results)
+            count = _parse_visual_response(raw, model_schema, results, ctx_by_name)
             if count is not None:
                 print(f"       [VIS] Parsed {count} visual definitions")
                 cache.put(prompt, raw, tag="worksheet_batch")
@@ -754,6 +831,7 @@ def _build_single_visual_from_spec(vis_spec, model_schema):
         role = f.get("role", "")
         is_measure = f.get("is_measure", False)
         agg_func = f.get("agg_function")
+        date_part = f.get("date_part")
 
         if not tbl or not col or not role:
             continue
@@ -764,6 +842,21 @@ def _build_single_visual_from_spec(vis_spec, model_schema):
         tbl_schema = model_schema.get(tbl, {})
         valid_cols = tbl_schema.get("columns", [])
         valid_measures = tbl_schema.get("measures", [])
+
+        # Date-part substitution: Tableau yr:/qr:/mn:/tmn:/twk: shelves
+        # need to resolve to the matching pre-computed calc column so the
+        # PBI axis shows Year / Quarter / Month / Week at the same
+        # granularity Tableau did. bim_generator auto-materialises
+        # "<base> (Year)" / "(Quarter)" / "(Month)" / "(Week)" / "(Day)"
+        # for every date column; we substitute the binding here.
+        if date_part in ("Year", "Quarter", "Month", "Week", "Day"):
+            derived_name = f"{col} ({date_part})"
+            if derived_name in valid_cols:
+                col = derived_name
+                # Date-part columns are dimensions on the axis — never
+                # aggregate them, even if Claude suggested Sum/Avg.
+                agg_func = None
+                is_measure = False
 
         # Auto-detect measure if in measures list
         if col in valid_measures:
