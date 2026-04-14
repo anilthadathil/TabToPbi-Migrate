@@ -1218,6 +1218,9 @@ def _build_slicer_visual(table, column, source_alias="s"):
     }
 
 
+_HTML_VIS_GUID = "htmlContent443BE3AD55E043BF878BED274D3A6855"
+
+
 def _build_textbox_visual(text_content):
     """Build a textbox visual definition."""
     return {
@@ -1225,6 +1228,29 @@ def _build_textbox_visual(text_content):
         "objects": {
             "general": [{"properties": {
                 "paragraphs": [{"textRuns": [{"value": text_content}]}]
+            }}],
+        },
+    }
+
+
+def _build_html_content_visual(url):
+    """Build an HTML Content custom visual that embeds a URL via iframe.
+
+    Requires the htmlContent443BE3AD55E043BF878BED274D3A6855 custom visual
+    to be bundled in the PBIP (handled by migrate.py) or installed globally
+    in PBI Desktop.
+    """
+    iframe = (
+        f'<iframe src="{url}" '
+        f'width="100%" height="100%" '
+        f'frameborder="0" '
+        f'style="border:none;"></iframe>'
+    )
+    return {
+        "visualType": _HTML_VIS_GUID,
+        "objects": {
+            "general": [{"properties": {
+                "paragraphs": [{"textRuns": [{"value": iframe}]}]
             }}],
         },
     }
@@ -1294,7 +1320,16 @@ def assemble_page(db_name, containers, visual_map, model_schema, ordinal=0):
         elif zone_type == "text":
             text = container.get("text_content", "")
             if text:
-                vis_def = _build_textbox_visual(text)
+                # If the text contains a URL from a Tableau Web Page zone,
+                # use the HTML Content custom visual to render an iframe.
+                if text.startswith("[Web Page") and "\n" in text:
+                    url = text.split("\n", 1)[1].strip()
+                    if url.startswith("http"):
+                        vis_def = _build_html_content_visual(url)
+                    else:
+                        vis_def = _build_textbox_visual(text)
+                else:
+                    vis_def = _build_textbox_visual(text)
                 vc = _build_visual_container(vis_def, x, y, w, h, z)
                 visual_containers.append(vc)
 
