@@ -742,25 +742,14 @@ def _create_pbip_project(bim_path, output_dir, workbook_name, report_pages=None)
             "visualContainers": []
         }]
 
-    # Bundle HTML Content custom visual (for Tableau Web Page embeds).
-    # Use \\?\ prefix on Windows to handle long paths (GUID-based dir
-    # names + long workbook names easily exceed the 260-char limit).
-    _HTML_VIS_GUID = "htmlContent443BE3AD55E043BF878BED274D3A6855"
-    _html_vis_assets = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "htmlContent")
-    if os.path.isdir(_html_vis_assets):
-        cv_dir = os.path.abspath(os.path.join(pbip_dir, "customVisuals", _HTML_VIS_GUID))
-        if os.name == "nt":
-            cv_dir = "\\\\?\\" + cv_dir
-        os.makedirs(cv_dir, exist_ok=True)
-        for root_d, _, files in os.walk(_html_vis_assets):
-            for fname in files:
-                src = os.path.join(root_d, fname)
-                rel = os.path.relpath(src, _html_vis_assets)
-                dst = os.path.join(cv_dir, rel)
-                if os.name == "nt" and not dst.startswith("\\\\?\\"):
-                    dst = "\\\\?\\" + os.path.abspath(dst)
-                os.makedirs(os.path.dirname(dst), exist_ok=True)
-                shutil.copy2(src, dst)
+    # HTML Content custom visual for Tableau Web Page embeds.
+    # NOT bundled in the PBIP — PBI Desktop enforces a 260-char path
+    # limit and the GUID-based custom visual subdirectory + long workbook
+    # names exceed it. Instead, the visual must be installed globally in
+    # PBI Desktop (Options → Custom visuals → Add). The report.json
+    # references the visual by GUID; if installed, PBI renders the
+    # iframe. If not, PBI shows a "install this visual" prompt — which
+    # is better than crashing the entire PBIP load.
 
     with open(os.path.join(pbip_dir, "report.json"), "w") as f:
         json.dump({
