@@ -409,6 +409,14 @@ def extract_dashboard_context(db, ds_caption_map):
             z["name"] = zone_name
         elif zone_type == "title":
             z["type"] = "title"
+        elif zone_type == "web":
+            url = zone.attrib.get("param", "")
+            dedup_key = ("web", url)
+            if dedup_key in seen_zone_keys:
+                continue
+            seen_zone_keys.add(dedup_key)
+            z["type"] = "text"
+            z["text"] = f"[Web Page — URL Action]\n{url}" if url else "[Web Page — URL Action]"
         elif zone_type == "empty":
             continue  # skip spacers
         else:
@@ -529,13 +537,21 @@ ORIENTATION RULE (very important):
 - Mark type "Bar" with DIMENSION on COLS and MEASURE on ROWS → clusteredColumnChart (VERTICAL bars).
 - When in doubt for Bar marks, check: if shelf_structure shows rows have dimensions (D>0), use clusteredBarChart.
 
+STACKED vs CLUSTERED — PBI Desktop's PBIP format DOES NOT support stackedColumnChart
+or stackedBarChart as built-in visual types. ALWAYS use clusteredColumnChart or
+clusteredBarChart instead. Do NOT emit stacked types — they cause blank error visuals.
+
 OTHER MARK TYPES:
-- Mark type "Area" → stackedAreaChart (if color/series encoding) or areaChart.
+- Mark type "Area" → areaChart.
 - Mark type "Line" → lineChart.
 - Mark type "Circle" → scatterChart (if BOTH axes have measures) or clusteredBarChart.
 - Mark type "Square" with color encoding → matrix (for pivot/crosstab layout).
 - Mark type "Text" with MANY rows of data → tableEx. With SINGLE value → card.
 - Mark type "Map" or is_map=true → filledMap (for Multipolygon) or map.
+  CRITICAL for map/filledMap: you MUST include a measure on the Size or Values role
+  (e.g. Sum of Sales, Count of rows). Without a measure PBI renders an empty map.
+  If no measure is in the Tableau context, pick the first numeric measure from the
+  model schema for that table.
 - Mark type "Automatic": infer from shelf_structure:
   * rows(0D,0M) cols(0D,0M) with only text/label encoding → card or multiRowCard
   * Dimension on rows + measure on cols → clusteredBarChart
@@ -793,6 +809,25 @@ def convert_worksheets_to_visuals(ws_contexts, model_schema, model="haiku",
     return results
 
 
+# PBI Desktop PBIP only recognises a subset of visual type IDs as
+# built-in. Unrecognised types show "To see this custom visual, add it
+# to this report first" — blank rectangle. Map to safe fallbacks.
+_VISUAL_TYPE_FALLBACK = {
+    "stackedColumnChart":               "clusteredColumnChart",
+    "stackedBarChart":                   "clusteredBarChart",
+    "hundredPercentStackedColumnChart":  "clusteredColumnChart",
+    "hundredPercentStackedBarChart":     "clusteredBarChart",
+    "stackedAreaChart":                  "areaChart",
+    "hundredPercentStackedAreaChart":    "areaChart",
+    "gauge":                             "card",
+    "waterfall":                         "clusteredColumnChart",
+    "funnel":                            "clusteredBarChart",
+    "histogram":                         "clusteredColumnChart",
+    "ribbonChart":                       "clusteredColumnChart",
+    "basicShape":                        "textbox",
+}
+
+
 def _build_single_visual_from_spec(vis_spec, model_schema):
     """Build a complete singleVisual dict from Claude's field assignment spec.
 
@@ -800,6 +835,7 @@ def _build_single_visual_from_spec(vis_spec, model_schema):
     this function builds the exact PBI JSON structure.
     """
     visual_type = vis_spec.get("visualType", "clusteredBarChart")
+    visual_type = _VISUAL_TYPE_FALLBACK.get(visual_type, visual_type)
     title = vis_spec.get("title", "")
     fields = vis_spec.get("fields", [])
 
@@ -889,6 +925,20 @@ def _build_single_visual_from_spec(vis_spec, model_schema):
 
     if not select_entries:
         return None
+
+    # Deduplicate Tooltips: a queryRef already in Category/Series/Y/Y2
+    # must NOT also appear in Tooltips — PBI generates an invalid query.
+    primary_refs = set()
+    for role in ("Category", "Y", "Y2", "Series"):
+        for p in projections.get(role, []):
+            primary_refs.add(p.get("queryRef", ""))
+    if "Tooltips" in projections:
+        projections["Tooltips"] = [
+            p for p in projections["Tooltips"]
+            if p.get("queryRef", "") not in primary_refs
+        ]
+        if not projections["Tooltips"]:
+            del projections["Tooltips"]
 
     # Build prototypeQuery
     proto_query = {

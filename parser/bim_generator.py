@@ -42,6 +42,28 @@ _M_TYPE_MAP = {
     "boolean": "type logical",
 }
 
+# Column name (lowercase) → TOM dataCategory for geographic columns.
+# Setting dataCategory lets PBI's filledMap / map visuals geocode
+# correctly (auto-zoom to the right region instead of world view).
+_GEO_CATEGORY = {
+    "state": "StateOrProvince",
+    "state/province": "StateOrProvince",
+    "province": "StateOrProvince",
+    "region": "StateOrProvince",
+    "country": "Country",
+    "country/region": "Country",
+    "city": "City",
+    "county": "County",
+    "postal code": "PostalCode",
+    "zip code": "PostalCode",
+    "zip": "PostalCode",
+    "latitude": "Latitude",
+    "longitude": "Longitude",
+    "address": "Address",
+    "continent": "Continent",
+    "place": "Place",
+}
+
 
 def _is_measure(formula):
     if not formula:
@@ -1076,6 +1098,12 @@ def generate_bim(metadata, csv_dir, pg_config=None):
             folder = folders.get(c["internal_name"]) or folders.get(c["name"])
             if folder:
                 col_def["displayFolder"] = folder
+            # Geographic data category — enables PBI's filledMap /
+            # map visuals to geocode correctly (auto-zoom to the right
+            # region instead of showing the entire world).
+            geo_cat = _GEO_CATEGORY.get(c["name"].lower())
+            if geo_cat:
+                col_def["dataCategory"] = geo_cat
             tom_columns.append(col_def)
 
         # Auto-generate date-part derivative columns for every date/datetime
