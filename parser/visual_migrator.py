@@ -547,11 +547,12 @@ OTHER MARK TYPES:
 - Mark type "Circle" → scatterChart (if BOTH axes have measures) or clusteredBarChart.
 - Mark type "Square" with color encoding → matrix (for pivot/crosstab layout).
 - Mark type "Text" with MANY rows of data → tableEx. With SINGLE value → card.
-- Mark type "Map" or is_map=true → filledMap (for Multipolygon) or map.
-  CRITICAL for map/filledMap: you MUST include a measure on the Size or Values role
-  (e.g. Sum of Sales, Count of rows). Without a measure PBI renders an empty map.
-  If no measure is in the Tableau context, pick the first numeric measure from the
-  model schema for that table.
+- Mark type "Map" or is_map=true → clusteredBarChart (NOT filledMap or map — both
+  are deprecated in PBI Desktop 2026 and render as blank world maps). Use
+  clusteredBarChart with the geographic dimension (State/City/Country) on Category
+  and a measure on Y. The user can convert to the new Azure Maps visual manually.
+  You MUST include a measure (e.g. Sum of Sales). If no measure is in the Tableau
+  context, pick the first numeric measure from the model schema.
 - Mark type "Automatic": infer from shelf_structure:
   * rows(0D,0M) cols(0D,0M) with only text/label encoding → card or multiRowCard
   * Dimension on rows + measure on cols → clusteredBarChart
@@ -819,6 +820,9 @@ _VISUAL_TYPE_FALLBACK = {
     "hundredPercentStackedBarChart":     "clusteredBarChart",
     "stackedAreaChart":                  "areaChart",
     "hundredPercentStackedAreaChart":    "areaChart",
+    "filledMap":                         "clusteredBarChart",
+    "map":                               "clusteredBarChart",
+    "shapeMap":                          "clusteredBarChart",
     "gauge":                             "card",
     "waterfall":                         "clusteredColumnChart",
     "funnel":                            "clusteredBarChart",
