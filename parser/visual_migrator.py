@@ -959,6 +959,10 @@ def _build_single_visual_from_spec(vis_spec, model_schema):
             "text": {"expr": {"Literal": {"Value": f"'{title}'"}}}
         }}]
 
+    # Visual-level objects (separate from vcObjects which is container-level).
+    # Data labels go here — vcObjects is for container overrides like title.
+    vis_objects = {}
+
     # Enable data labels on bar/column/combo charts — Tableau shows
     # values on every bar segment by default; PBI doesn't.
     _LABEL_TYPES = {
@@ -967,16 +971,19 @@ def _build_single_visual_from_spec(vis_spec, model_schema):
         "areaChart", "lineChart",
     }
     if visual_type in _LABEL_TYPES:
-        vc_objects["labels"] = [{"properties": {
+        vis_objects["labels"] = [{"properties": {
             "show": {"expr": {"Literal": {"Value": "true"}}},
         }}]
 
-    return {
+    result = {
         "visualType": visual_type,
         "projections": projections,
         "prototypeQuery": proto_query,
         "vcObjects": vc_objects,
     }
+    if vis_objects:
+        result["objects"] = vis_objects
+    return result
 
 
 def convert_dashboard_to_page(db_context, visual_map, model_schema, field_name_map=None, model="haiku"):
