@@ -794,11 +794,12 @@ def _deploy_via_pbip(bim_path, output_dir, workbook_name, data_dir, metadata=Non
 
     # --- Inject web-page URL measures into model.bim ---
     # The HTML Content visual needs a DAX measure returning the iframe
-    # HTML. Collect URLs from the visual migration details and add one
-    # measure per URL to the first non-Parameters table in the model.
+    # HTML. When a Tableau URL Action references a field like <[State]>,
+    # the DAX measure uses SELECTEDVALUE so clicking a map state updates
+    # the embedded web page — matching Tableau's interactive behavior.
     from parser.visual_migrator import get_last_migration_details, _HTML_VIS_GUID
     details = get_last_migration_details()
-    web_urls = {}  # measure_name → url
+    web_urls = {}  # measure_name → static_url
     if details.get("db_contexts"):
         idx = 0
         for db_ctx in details["db_contexts"]:
@@ -810,6 +811,31 @@ def _deploy_via_pbip(bim_path, output_dir, workbook_name, data_dir, metadata=Non
                         idx += 1
                         mname = f"WebPage_{idx}" if idx > 1 else "WebPage_1"
                         web_urls[mname] = url
+
+    # Look for Tableau URL actions with field references like <[State]>
+    # and build dynamic SELECTEDVALUE measures.
+    url_action_patterns = {}  # measure_name → link_expression
+    if twb_path and web_urls:
+        try:
+            from parser.xml_parser import load_xml as _load_xml
+            _twb = _load_xml(twb_path)
+            for action in _twb.findall('.//action'):
+                link = action.find('.//link')
+                if link is not None:
+                    expr = link.attrib.get("expression", "")
+                    if expr and "<[" in expr:
+                        # Match to a web_url by checking if the static URL
+                        # is a concrete instance of this pattern
+                        for mname, static_url in web_urls.items():
+                            if mname not in url_action_patterns:
+                                # Check overlap: strip field refs and compare
+                                import re as _re2
+                                base = _re2.sub(r"<\[[^\]]+\]>", "", expr)
+                                if base and base[:20] in static_url:
+                                    url_action_patterns[mname] = expr
+        except Exception:
+            pass
+
     if web_urls:
         with open(bim_path, "r", encoding="utf-8") as _f:
             _bim = json.load(_f)
@@ -820,18 +846,63 @@ def _deploy_via_pbip(bim_path, output_dir, workbook_name, data_dir, metadata=Non
                 target_table = t
                 break
         if target_table:
+            tbl_name = target_table["name"]
+            # Columns in this table for field matching
+            tbl_cols = {c["name"] for c in target_table.get("columns", [])}
             existing = {m["name"] for m in target_table.get("measures", [])}
-            for mname, url in web_urls.items():
-                if mname not in existing:
-                    iframe = (f'"<iframe src=\'{url}\' '
-                              f'width=\'100%\' height=\'100%\' '
-                              f'frameborder=\'0\' style=\'border:none;\'>'
-                              f'</iframe>"')
-                    target_table.setdefault("measures", []).append({
-                        "name": mname,
-                        "expression": iframe,
-                        "isHidden": True,
-                    })
+
+            for mname, static_url in web_urls.items():
+                if mname in existing:
+                    continue
+                pattern = url_action_patterns.get(mname)
+                if pattern:
+                    # Build dynamic DAX with SELECTEDVALUE
+                    # Pattern like: https://en.wikipedia.org/wiki/<[State]>
+                    import re as _re3
+                    parts = _re3.split(r"(<\[[^\]]+\]>)", pattern)
+                    dax_parts = []
+                    default_val = ""
+                    for part in parts:
+                        m = _re3.match(r"<\[([^\]]+)\]>", part)
+                        if m:
+                            col = m.group(1)
+                            # Extract default from the static URL
+                            if not default_val:
+                                static_stripped = _re3.sub(r"(<\[[^\]]+\]>)", "|||", pattern)
+                                pieces = static_stripped.split("|||")
+                                if len(pieces) >= 2 and pieces[0] in static_url:
+                                    default_val = static_url[len(pieces[0]):]
+                                    if pieces[1]:
+                                        default_val = default_val.split(pieces[1])[0]
+                            if col in tbl_cols:
+                                dax_parts.append(
+                                    f"SELECTEDVALUE('{tbl_name}'[{col}], \"{default_val}\")")
+                            else:
+                                dax_parts.append(f"\"{default_val}\"")
+                        else:
+                            if part:
+                                dax_parts.append(f"\"{part}\"")
+                    url_dax = " & ".join(dax_parts)
+                    iframe_dax = (
+                        f'"<iframe src=\'" & {url_dax} & '
+                        f'"\' width=\'100%\' height=\'100%\' '
+                        f'frameborder=\'0\' style=\'border:none;\'>'
+                        f'</iframe>"'
+                    )
+                    Status.info(f"  WebPage measure: dynamic URL with SELECTEDVALUE([{parts[1][2:-2] if len(parts)>1 else '?'}])")
+                else:
+                    # Static URL — no field references
+                    iframe_dax = (
+                        f'"<iframe src=\'{static_url}\' '
+                        f'width=\'100%\' height=\'100%\' '
+                        f'frameborder=\'0\' style=\'border:none;\'>'
+                        f'</iframe>"')
+
+                target_table.setdefault("measures", []).append({
+                    "name": mname,
+                    "expression": iframe_dax,
+                    "isHidden": True,
+                })
             with open(bim_path, "w", encoding="utf-8") as _f:
                 json.dump(_bim, _f, indent=2)
             Status.info(f"  Added {len(web_urls)} web-page DAX measure(s) to model")
