@@ -885,7 +885,7 @@ def _deploy_via_pbip(bim_path, output_dir, workbook_name, data_dir, metadata=Non
                     url_dax = " & ".join(dax_parts)
                     iframe_dax = (
                         f'"<iframe src=\'" & {url_dax} & '
-                        f'"\' width=\'100%\' height=\'100%\' '
+                        f'"\' width=\'100%\' height=\'600\' '
                         f'frameborder=\'0\' style=\'border:none;\'>'
                         f'</iframe>"'
                     )
@@ -894,7 +894,7 @@ def _deploy_via_pbip(bim_path, output_dir, workbook_name, data_dir, metadata=Non
                     # Static URL — no field references
                     iframe_dax = (
                         f'"<iframe src=\'{static_url}\' '
-                        f'width=\'100%\' height=\'100%\' '
+                        f'width=\'100%\' height=\'600\' '
                         f'frameborder=\'0\' style=\'border:none;\'>'
                         f'</iframe>"')
 
