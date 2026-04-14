@@ -959,6 +959,18 @@ def _build_single_visual_from_spec(vis_spec, model_schema):
             "text": {"expr": {"Literal": {"Value": f"'{title}'"}}}
         }}]
 
+    # Enable data labels on bar/column/combo charts — Tableau shows
+    # values on every bar segment by default; PBI doesn't.
+    _LABEL_TYPES = {
+        "clusteredBarChart", "clusteredColumnChart",
+        "lineClusteredColumnComboChart", "lineStackedColumnComboChart",
+        "areaChart", "lineChart",
+    }
+    if visual_type in _LABEL_TYPES:
+        vc_objects["labels"] = [{"properties": {
+            "show": {"expr": {"Literal": {"Value": "true"}}},
+        }}]
+
     return {
         "visualType": visual_type,
         "projections": projections,
