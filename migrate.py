@@ -691,6 +691,13 @@ def _create_pbip_project(bim_path, output_dir, workbook_name, report_pages=None)
     os.makedirs(pbip_dir, exist_ok=True)
     os.makedirs(model_dir, exist_ok=True)
 
+    # Clean up any stale customVisuals folder from previous runs —
+    # PBI Desktop crashes (260-char path limit) if it finds the
+    # GUID-based subdirectories left over from earlier bundling attempts.
+    cv_stale = os.path.join(pbip_dir, "customVisuals")
+    if os.path.isdir(cv_stale):
+        shutil.rmtree(cv_stale, ignore_errors=True)
+
     # .pbip project file
     with open(os.path.join(output_dir, workbook_name + ".pbip"), "w") as f:
         json.dump({
