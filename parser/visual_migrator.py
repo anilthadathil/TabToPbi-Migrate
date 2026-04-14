@@ -1260,7 +1260,7 @@ def _build_html_content_visual(url, model_schema=None):
     return {
         "visualType": _HTML_VIS_GUID,
         "projections": {
-            "Values": [{"queryRef": f"{table_name}.{measure_name}", "active": True}],
+            "content": [{"queryRef": f"{table_name}.{measure_name}", "active": True}],
         },
         "prototypeQuery": {
             "Version": 2,
