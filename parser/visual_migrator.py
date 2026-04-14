@@ -1233,25 +1233,45 @@ def _build_textbox_visual(text_content):
     }
 
 
-def _build_html_content_visual(url):
-    """Build an HTML Content custom visual that embeds a URL via iframe.
+_WEB_PAGE_COUNTER = [0]  # mutable counter for generating measure names
 
-    Requires the htmlContent443BE3AD55E043BF878BED274D3A6855 custom visual
-    to be bundled in the PBIP (handled by migrate.py) or installed globally
-    in PBI Desktop.
+
+def _build_html_content_visual(url, model_schema=None):
+    """Build an HTML Content custom visual bound to a DAX measure.
+
+    The HTML Content visual reads HTML from a measure/column bound via
+    prototypeQuery — NOT from objects.paragraphs (that's textbox format).
+    migrate.py injects a hidden measure named ``WebPage_N`` that returns
+    the iframe HTML. This function builds the visual binding to that measure.
     """
-    iframe = (
-        f'<iframe src="{url}" '
-        f'width="100%" height="100%" '
-        f'frameborder="0" '
-        f'style="border:none;"></iframe>'
-    )
+    _WEB_PAGE_COUNTER[0] += 1
+    measure_name = f"WebPage_{_WEB_PAGE_COUNTER[0]}"
+
+    # Find the table that holds the measure
+    table_name = None
+    if model_schema:
+        for tname, schema in model_schema.items():
+            if tname != "Parameters":
+                table_name = tname
+                break
+    if not table_name:
+        table_name = "Table"
+
     return {
         "visualType": _HTML_VIS_GUID,
-        "objects": {
-            "general": [{"properties": {
-                "paragraphs": [{"textRuns": [{"value": iframe}]}]
-            }}],
+        "projections": {
+            "Values": [{"queryRef": f"{table_name}.{measure_name}", "active": True}],
+        },
+        "prototypeQuery": {
+            "Version": 2,
+            "From": [{"Name": "h", "Entity": table_name, "Type": 0}],
+            "Select": [{
+                "Measure": {
+                    "Expression": {"SourceRef": {"Source": "h"}},
+                    "Property": measure_name,
+                },
+                "Name": f"{table_name}.{measure_name}",
+            }],
         },
     }
 
@@ -1325,7 +1345,7 @@ def assemble_page(db_name, containers, visual_map, model_schema, ordinal=0):
                 if text.startswith("[Web Page") and "\n" in text:
                     url = text.split("\n", 1)[1].strip()
                     if url.startswith("http"):
-                        vis_def = _build_html_content_visual(url)
+                        vis_def = _build_html_content_visual(url, model_schema)
                     else:
                         vis_def = _build_textbox_visual(text)
                 else:
@@ -1370,6 +1390,9 @@ def migrate_visuals(twb_root, metadata, bim_path=None, model="haiku"):
         list of page dicts for report.json sections
     """
     print(f"       [VIS] Starting visual migration...")
+
+    # Reset per-run counters
+    _WEB_PAGE_COUNTER[0] = 0
 
     # Build lookup maps
     ds_caption_map = {}

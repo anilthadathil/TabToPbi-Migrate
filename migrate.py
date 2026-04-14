@@ -792,6 +792,50 @@ def _deploy_via_pbip(bim_path, output_dir, workbook_name, data_dir, metadata=Non
     num_visuals = sum(len(p.get("visualContainers", [])) for p in report_pages)
     Status.info(f"Generated {len(report_pages)} pages with {num_visuals} visuals")
 
+    # --- Inject web-page URL measures into model.bim ---
+    # The HTML Content visual needs a DAX measure returning the iframe
+    # HTML. Collect URLs from the visual migration details and add one
+    # measure per URL to the first non-Parameters table in the model.
+    from parser.visual_migrator import get_last_migration_details, _HTML_VIS_GUID
+    details = get_last_migration_details()
+    web_urls = {}  # measure_name → url
+    if details.get("db_contexts"):
+        idx = 0
+        for db_ctx in details["db_contexts"]:
+            for z in db_ctx.get("zones", []):
+                if z.get("type") == "text" and z.get("text", "").startswith("[Web Page"):
+                    text = z["text"]
+                    url = text.split("\n", 1)[1].strip() if "\n" in text else ""
+                    if url.startswith("http"):
+                        idx += 1
+                        mname = f"WebPage_{idx}" if idx > 1 else "WebPage_1"
+                        web_urls[mname] = url
+    if web_urls:
+        with open(bim_path, "r", encoding="utf-8") as _f:
+            _bim = json.load(_f)
+        # Find first non-Parameters table
+        target_table = None
+        for t in _bim.get("model", {}).get("tables", []):
+            if t.get("name") != "Parameters" and not t.get("isPrivate"):
+                target_table = t
+                break
+        if target_table:
+            existing = {m["name"] for m in target_table.get("measures", [])}
+            for mname, url in web_urls.items():
+                if mname not in existing:
+                    iframe = (f'"<iframe src=\'{url}\' '
+                              f'width=\'100%\' height=\'100%\' '
+                              f'frameborder=\'0\' style=\'border:none;\'>'
+                              f'</iframe>"')
+                    target_table.setdefault("measures", []).append({
+                        "name": mname,
+                        "expression": iframe,
+                        "isHidden": True,
+                    })
+            with open(bim_path, "w", encoding="utf-8") as _f:
+                json.dump(_bim, _f, indent=2)
+            Status.info(f"  Added {len(web_urls)} web-page DAX measure(s) to model")
+
     # --- Create PBIP project ---
     Status.info("Creating Power BI project (PBIP)...")
     pbir_path = _create_pbip_project(bim_path, output_dir, workbook_name, report_pages)
