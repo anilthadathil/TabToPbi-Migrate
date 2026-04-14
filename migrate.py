@@ -916,7 +916,7 @@ def _deploy_via_pbip(bim_path, output_dir, workbook_name, data_dir, metadata=Non
     te_exe = _find_tabular_editor()
     if not te_exe:
         Status.warn("Tabular Editor not found — opening PBIP only.")
-        subprocess.Popen(["powershell", "-Command", f"Start-Process '{pbir_path}'"],
+        subprocess.Popen(["powershell", "-Command", f"Start-Process '{pbir_path.replace(chr(39), chr(39)+chr(39))}'"],
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         Status.info("PBI Desktop is opening the project. Click Refresh to load data.")
         return True, None
@@ -930,7 +930,7 @@ def _deploy_via_pbip(bim_path, output_dir, workbook_name, data_dir, metadata=Non
          "Get-Process PBIDesktop -ErrorAction SilentlyContinue | Stop-Process -Force; Start-Sleep -Seconds 2"],
         capture_output=True, timeout=10
     )
-    subprocess.Popen(["powershell", "-Command", f"Start-Process '{pbir_path}'"],
+    subprocess.Popen(["powershell", "-Command", f"Start-Process '{pbir_path.replace(chr(39), chr(39)+chr(39))}'"],
                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     # Wait for PBI Desktop to start and create AS instance
@@ -1175,7 +1175,7 @@ def _deploy_via_pbip(bim_path, output_dir, workbook_name, data_dir, metadata=Non
              "Get-Process PBIDesktop -ErrorAction SilentlyContinue | Stop-Process -Force; Start-Sleep -Seconds 3"],
             capture_output=True, timeout=10
         )
-        subprocess.Popen(["powershell", "-Command", f"Start-Process '{pbir_path}'"],
+        subprocess.Popen(["powershell", "-Command", f"Start-Process '{pbir_path.replace(chr(39), chr(39)+chr(39))}'"],
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         # Wait for PBI to restart
         for i in range(30):
