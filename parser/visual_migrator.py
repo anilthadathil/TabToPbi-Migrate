@@ -1360,6 +1360,48 @@ def assemble_page(db_name, containers, visual_map, model_schema, ordinal=0):
                 vc = _build_visual_container(vis_def, x, y, w, h, z)
                 visual_containers.append(vc)
 
+    # Post-process: if the page has an htmlContent visual (web embed),
+    # give it at least 60% of the page height and shrink the visual
+    # above it proportionally. The map's "being retired" banner and PBI
+    # chrome eat vertical space, so equal split looks lopsided.
+    html_vc = None
+    other_vcs = []
+    for vc in visual_containers:
+        cfg = json.loads(vc.get("config", "{}"))
+        vt = cfg.get("singleVisual", {}).get("visualType", "")
+        if _HTML_VIS_GUID in vt:
+            html_vc = vc
+        elif vt not in ("textbox",):
+            other_vcs.append(vc)
+
+    if html_vc:
+        title_h = 50
+        avail = PBI_PAGE_HEIGHT - title_h
+        web_h = int(avail * 0.60)
+        map_h = avail - web_h
+        web_y = title_h + map_h
+
+        # Resize the HTML Content visual
+        cfg = json.loads(html_vc["config"])
+        pos = cfg["layouts"][0]["position"]
+        pos["y"] = web_y
+        pos["height"] = web_h
+        html_vc["config"] = json.dumps(cfg)
+        html_vc["y"] = float(web_y)
+        html_vc["height"] = float(web_h)
+
+        # Resize the main chart/map above it
+        for vc in other_vcs:
+            cfg = json.loads(vc["config"])
+            pos = cfg["layouts"][0]["position"]
+            if pos.get("y", 0) < web_y:
+                pos["y"] = title_h
+                pos["height"] = map_h
+                cfg["layouts"][0]["position"] = pos
+                vc["config"] = json.dumps(cfg)
+                vc["y"] = float(title_h)
+                vc["height"] = float(map_h)
+
     return {
         "name": f"ReportSection_{page_name}",
         "displayName": db_name,
