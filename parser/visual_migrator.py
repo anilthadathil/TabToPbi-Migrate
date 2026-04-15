@@ -1501,36 +1501,44 @@ def migrate_visuals(twb_root, metadata, bim_path=None, model="haiku"):
 
     # Step 5: Convert dashboards to PBI pages DETERMINISTICALLY
     pages = []
-    if db_contexts:
-        for di, db_ctx in enumerate(db_contexts):
-            containers = convert_dashboard_to_page(
-                db_ctx, visual_map, model_schema,
-                field_name_map=field_name_map, model=model
+    used_worksheets = set()  # worksheet names referenced by any dashboard
+    for di, db_ctx in enumerate(db_contexts):
+        containers = convert_dashboard_to_page(
+            db_ctx, visual_map, model_schema,
+            field_name_map=field_name_map, model=model
+        )
+        if containers:
+            page = assemble_page(
+                db_ctx["name"], containers, visual_map, model_schema, ordinal=di
             )
-            if containers:
-                page = assemble_page(
-                    db_ctx["name"], containers, visual_map, model_schema, ordinal=di
-                )
-                pages.append(page)
-    else:
-        # No dashboards — create one page per worksheet
-        for wi, ctx in enumerate(ws_contexts):
-            ws_name = ctx["name"]
-            vis_def = visual_map.get(ws_name)
-            if not vis_def:
-                continue
-            vc = _build_visual_container(vis_def, 10, 10, 1260, 700, 0)
-            pages.append({
-                "name": f"ReportSection_{re.sub(r'[^A-Za-z0-9_]', '_', ws_name)}",
-                "displayName": ws_name,
-                "config": "{}",
-                "displayOption": 0,
-                "height": float(PBI_PAGE_HEIGHT),
-                "width": float(PBI_PAGE_WIDTH),
-                "filters": "[]",
-                "ordinal": wi,
-                "visualContainers": [vc],
-            })
+            pages.append(page)
+        # Record every sheet-zone worksheet — even if the page wasn't emitted,
+        # a worksheet explicitly placed on a dashboard shouldn't double up as
+        # a standalone page.
+        for z in db_ctx.get("zones", []):
+            if z.get("type") == "sheet" and z.get("name"):
+                used_worksheets.add(z["name"])
+
+    # Step 5b: Worksheets NOT placed on any dashboard — one standalone page each.
+    for ctx in ws_contexts:
+        ws_name = ctx["name"]
+        if ws_name in used_worksheets:
+            continue
+        vis_def = visual_map.get(ws_name)
+        if not vis_def:
+            continue
+        vc = _build_visual_container(vis_def, 10, 10, 1260, 700, 0)
+        pages.append({
+            "name": f"ReportSection_{re.sub(r'[^A-Za-z0-9_]', '_', ws_name)}",
+            "displayName": ws_name,
+            "config": "{}",
+            "displayOption": 0,
+            "height": float(PBI_PAGE_HEIGHT),
+            "width": float(PBI_PAGE_WIDTH),
+            "filters": "[]",
+            "ordinal": len(pages),
+            "visualContainers": [vc],
+        })
 
     total_visuals = sum(len(p.get("visualContainers", [])) for p in pages)
     print(f"       [VIS] Generated {len(pages)} pages with {total_visuals} visuals")
