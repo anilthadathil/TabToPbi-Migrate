@@ -290,7 +290,7 @@ def _classify_all_visuals(visual_map, ws_contexts):
 
 
 def _sheet_summary(wb, workbook_name, input_path, metadata, bim, visual_map,
-                   pages, db_contexts, stats, now, classification=None):
+                   pages, db_contexts, stats, now):
     ws = wb.create_sheet("Summary")
     row = _write_title(
         ws,
@@ -327,50 +327,6 @@ def _sheet_summary(wb, workbook_name, input_path, metadata, bim, visual_map,
         ["Relationships", "—", len(rels)],
     ]
     _write_table(ws, row, headers, [[_normalise(c) for c in r] for r in rows])
-
-    # -----------------------------------------------------------------
-    # Visual mapping fidelity breakdown + manual-review callout.
-    # -----------------------------------------------------------------
-    if classification:
-        from collections import Counter
-        counts = Counter(c[3] for c in classification)
-        total = len(classification)
-        direct = counts.get("DIRECT", 0)
-        similar = counts.get("SIMILAR", 0)
-        no_eq = counts.get("NOT_AVAILABLE", 0)
-        review = similar + no_eq
-
-        row_cat = ws.max_row + 3
-        ws.cell(row=row_cat, column=1,
-                value="Visual mapping fidelity").font = _TITLE_FONT
-        cat_rows = [
-            ["Direct mapping (1:1 — no review needed)",      direct, _pct(direct, total)],
-            ["Similar mapping (manual review suggested)",    similar, _pct(similar, total)],
-            ["No direct mapping (rebuild required)",         no_eq, _pct(no_eq, total)],
-            ["TOTAL",                                         total, "100%"],
-        ]
-        fills = [
-            _CAT_FILL["DIRECT"],
-            _CAT_FILL["SIMILAR"],
-            _CAT_FILL["NOT_AVAILABLE"],
-            None,
-        ]
-        _write_table(
-            ws, row_cat + 1,
-            ["Category", "Count", "Share"],
-            cat_rows, row_fills=fills,
-        )
-
-        # Callout row if anything needs review.
-        if review > 0:
-            row_note = ws.max_row + 2
-            note = (f"→ {review} of {total} visuals require manual review. "
-                    f"See the 'Manual Review' sheet for the focused list.")
-            cell = ws.cell(row=row_note, column=1, value=note)
-            cell.font = Font(bold=True, color="9C5700")
-            cell.fill = _WARN_FILL
-            ws.merge_cells(start_row=row_note, start_column=1,
-                           end_row=row_note, end_column=3)
 
     # Pipeline stats block below
     if stats:
@@ -558,45 +514,6 @@ def _sheet_visual_mapping(wb, visual_map, ws_contexts, classification):
             # subsequent field rows stay unshaded so the grouping is
             # visually obvious.
             row_fills.append(cat_fill if j == 0 else None)
-
-    _write_table(ws, row, headers, data_rows, row_fills)
-    _autosize_columns(ws, start_row=row)
-
-
-def _sheet_manual_review(wb, classification):
-    """Focused worklist of visuals that need a human eye.
-
-    Only includes SIMILAR + NOT_AVAILABLE entries — DIRECT visuals are
-    left out. Category is shaded, so a reviewer can sort by category and
-    work top-down.
-    """
-    non_direct = [c for c in (classification or []) if c[3] != "DIRECT"]
-    if not non_direct:
-        return
-
-    ws = wb.create_sheet("Manual Review")
-    row = _write_title(
-        ws, "Manual review — visuals that need a human",
-        f"{len(non_direct)} visuals are SIMILAR or NOT_AVAILABLE. "
-        "Sort by Category and walk top-down. DIRECT mappings are omitted.",
-    )
-
-    headers = ["#", "Tableau Worksheet", "Tableau Mark",
-               "PBI Visual Type", "Category", "Action", "Review Note"]
-    data_rows = []
-    row_fills = []
-    # NOT_AVAILABLE first (highest priority), then SIMILAR.
-    non_direct.sort(key=lambda c: (0 if c[3] == "NOT_AVAILABLE" else 1,
-                                   c[0].lower()))
-    for i, (name, marks, vtype, category, reason) in enumerate(non_direct, start=1):
-        action = ("Rebuild with custom visual"
-                  if category == "NOT_AVAILABLE"
-                  else "Review encoding / styling")
-        data_rows.append([
-            i, name, ", ".join(marks) if marks else "—",
-            vtype, category, action, reason,
-        ])
-        row_fills.append(_CAT_FILL.get(category))
 
     _write_table(ws, row, headers, data_rows, row_fills)
     _autosize_columns(ws, start_row=row)
@@ -828,18 +745,16 @@ def generate_migration_report(
     # Remove the default blank sheet — we'll create named sheets.
     wb.remove(wb.active)
 
-    # Compute fidelity classification once — the Summary, Visual Mapping,
-    # and Manual Review sheets all consume it.
+    # Compute fidelity classification once — the Visual Mapping sheet consumes it.
     classification = _classify_all_visuals(visual_map, ws_contexts) \
         if (visual_map or ws_contexts) else []
 
     _sheet_summary(wb, workbook_name, input_path, metadata, bim, visual_map,
-                   pages, db_contexts, stats, now, classification=classification)
+                   pages, db_contexts, stats, now)
     _sheet_data_model(wb, metadata, bim, csv_dir)
     _sheet_relationships(wb, bim)
     if visual_map or ws_contexts:
         _sheet_visual_mapping(wb, visual_map, ws_contexts, classification)
-        _sheet_manual_review(wb, classification)
     if pages or db_contexts:
         _sheet_dashboards(wb, pages, db_contexts)
     _sheet_calculations(wb, metadata, bim)
