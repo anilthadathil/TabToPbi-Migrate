@@ -1074,7 +1074,7 @@ def _deploy_via_pbip(bim_path, output_dir, workbook_name, data_dir, metadata=Non
         if validation_round >= max_validation_rounds - 1:
             break  # don't send Haiku again — escalate to Opus below
 
-        Status.info("Sending errors to Claude for correction...")
+        Status.info("Sending errors for correction...")
         current_bim, correction_formulas, error_map = _build_correction_batch(dax_errors, bim_abs)
 
         if correction_formulas:
@@ -1090,10 +1090,10 @@ def _deploy_via_pbip(bim_path, output_dir, workbook_name, data_dir, metadata=Non
     # --- Phase 2: Opus escalation for persistent errors ---
     if remaining_errors:
         max_opus_rounds = 2
-        Status.warn(f"Haiku could not resolve {len(remaining_errors)} errors — escalating to Opus")
+        Status.warn(f"Primary converter could not resolve {len(remaining_errors)} errors — escalating to advanced converter")
 
         for opus_round in range(max_opus_rounds):
-            Status.info(f"Opus correction round {opus_round + 1}/{max_opus_rounds}...")
+            Status.info(f"Advanced correction round {opus_round + 1}/{max_opus_rounds}...")
             current_bim, correction_formulas, error_map = _build_correction_batch(remaining_errors, bim_abs)
 
             if correction_formulas:
@@ -1104,14 +1104,14 @@ def _deploy_via_pbip(bim_path, output_dir, workbook_name, data_dir, metadata=Non
                 )
                 applied = _apply_corrections(corrections, error_map, current_bim, bim_abs, output_dir, workbook_name)
                 had_corrections = True
-                Status.info(f"Opus applied {applied}/{len(remaining_errors)} corrections")
+                Status.info(f"Advanced converter applied {applied}/{len(remaining_errors)} corrections")
 
             # Re-validate
-            Status.info(f"AS Validation after Opus round {opus_round + 1}...")
+            Status.info(f"AS Validation after advanced round {opus_round + 1}...")
             dax_errors = _run_as_validation(te_exe, bim_abs, port)
 
             if not dax_errors:
-                Status.success("AS Validation passed - 0 DAX errors (Opus resolved)")
+                Status.success("AS Validation passed - 0 DAX errors (advanced resolved)")
                 remaining_errors = []
                 break
 
@@ -1121,7 +1121,7 @@ def _deploy_via_pbip(bim_path, output_dir, workbook_name, data_dir, metadata=Non
             remaining_errors = dax_errors
 
         if remaining_errors:
-            Status.warn(f"{len(remaining_errors)} errors remain after Opus escalation")
+            Status.warn(f"{len(remaining_errors)} errors remain after advanced escalation")
 
     # --- Phase 3: Cache corrected DAX for formulas that passed validation ---
     # Read the final bim and cache every measure/calc-column expression that

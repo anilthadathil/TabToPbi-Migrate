@@ -1226,7 +1226,7 @@ def generate_bim(metadata, csv_dir, pg_config=None):
                     ds_name_map, field_name_map,
                 )
                 t1 = _time.time()
-                print(f"       [LOG] Pass 1 batch: Claude returned {len(claude_out)}/{len(cache_misses)} in {t1 - t0:.1f}s")
+                print(f"       [LOG] Pass 1 batch: converter returned {len(claude_out)}/{len(cache_misses)} in {t1 - t0:.1f}s")
 
                 # Accept valid results, track failures
                 pass1_accepted = 0

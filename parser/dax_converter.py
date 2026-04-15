@@ -429,13 +429,13 @@ def _call_claude(prompt, timeout=90, model=None):
                      encoding="utf-8", errors="replace")
         elapsed = _time.time() - t0
         if r.returncode != 0:
-            print(f"       [LOG] _call_claude: FAILED rc={r.returncode} ({elapsed:.1f}s) stderr={r.stderr[:150]}")
+            print(f"       [LOG] Conversion: FAILED rc={r.returncode} ({elapsed:.1f}s) stderr={r.stderr[:150]}")
             return None
         out = r.stdout.strip()
         if not out:
-            print(f"       [LOG] _call_claude: EMPTY response ({elapsed:.1f}s)")
+            print(f"       [LOG] Conversion: EMPTY response ({elapsed:.1f}s)")
             return None
-        print(f"       [LOG] _call_claude: OK ({elapsed:.1f}s, {len(out)} chars, {len(out.splitlines())} lines)")
+        print(f"       [LOG] Conversion: OK ({elapsed:.1f}s, {len(out)} chars, {len(out.splitlines())} lines)")
         if out.startswith('"') and out.endswith('"'):
             try:
                 out = _json.loads(out)
@@ -443,10 +443,10 @@ def _call_claude(prompt, timeout=90, model=None):
                 out = out[1:-1]
         return out.replace("\\n", "\n")
     except _sp.TimeoutExpired:
-        print(f"       [LOG] _call_claude: TIMEOUT after {timeout}s")
+        print(f"       [LOG] Conversion: TIMEOUT after {timeout}s")
         return None
     except Exception as e:
-        print(f"       [LOG] _call_claude: EXCEPTION {e}")
+        print(f"       [LOG] Conversion: EXCEPTION {e}")
         return None
 
 

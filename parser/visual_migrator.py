@@ -510,19 +510,19 @@ def _call_claude(prompt, timeout=120, model=None):
                           encoding="utf-8", errors="replace")
         elapsed = time.time() - t0
         if r.returncode != 0:
-            print(f"       [VIS] Claude FAILED rc={r.returncode} ({elapsed:.1f}s)")
+            print(f"       [VIS] Conversion FAILED rc={r.returncode} ({elapsed:.1f}s)")
             return None
         out = r.stdout.strip()
         if not out:
-            print(f"       [VIS] Claude EMPTY response ({elapsed:.1f}s)")
+            print(f"       [VIS] Conversion EMPTY response ({elapsed:.1f}s)")
             return None
-        print(f"       [VIS] Claude OK ({elapsed:.1f}s, {len(out)} chars)")
+        print(f"       [VIS] Conversion OK ({elapsed:.1f}s, {len(out)} chars)")
         return out
     except subprocess.TimeoutExpired:
-        print(f"       [VIS] Claude TIMEOUT after {timeout}s")
+        print(f"       [VIS] Conversion TIMEOUT after {timeout}s")
         return None
     except Exception as e:
-        print(f"       [VIS] Claude ERROR: {e}")
+        print(f"       [VIS] Conversion ERROR: {e}")
         return None
 
 
@@ -784,10 +784,10 @@ def convert_worksheets_to_visuals(ws_contexts, model_schema, model="haiku",
         if cached:
             count = _parse_visual_response(cached, model_schema, results, ctx_by_name)
             if count is not None:
-                print(f"       [VIS] Cache HIT — parsed {count} visual definitions (skipped Claude)")
+                print(f"       [VIS] Cache HIT — parsed {count} visual definitions (skipped conversion)")
                 continue
             # Cached blob somehow doesn't parse — fall through to a fresh call.
-            print(f"       [VIS] Cache entry unparseable — re-calling Claude")
+            print(f"       [VIS] Cache entry unparseable — re-running conversion")
 
         # 2. Fresh Claude call. Up to 3 attempts.
         for attempt in range(3):
